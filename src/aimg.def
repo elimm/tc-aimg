@@ -1,0 +1,11 @@
+LIBRARY aimg
+EXPORTS
+    ContentGetSupportedField
+    ContentGetSupportedFieldW
+    ContentGetValue
+    ContentGetValueW
+    ContentGetDetectString
+    ContentSetDefaultParams
+    ContentSetDefaultParamsW
+    ContentSendStateInformation
+    ContentSendStateInformationW

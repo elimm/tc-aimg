@@ -1,0 +1,99 @@
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64, x86]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Compile plugin
+        shell: cmd
+        run: |
+          if "${{ matrix.arch }}"=="x64" (
+            set MACHINE=X64
+            set OUT=aimg.wdx64
+          ) else (
+            set MACHINE=X86
+            set OUT=aimg.wdx
+          )
+          rc /fo aimg.res /i src src\aimg.rc
+          if errorlevel 1 exit /b 1
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fe:%OUT% /link /DEF:src\aimg.def aimg.res /MACHINE:%MACHINE% /LTCG /OPT:REF /OPT:ICF
+          if errorlevel 1 exit /b 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aimg-${{ matrix.arch }}
+          path: aimg.wdx*
+          retention-days: 7
+
+  release:
+    name: Package release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # build_msvc.bat hardcodes a local BuildTools path and isn't portable to
+      # the runner's VS layout, so the /MT + /MD, x64 + x86 matrix is
+      # reproduced here directly via ilammy/msvc-dev-cmd for env setup.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build x64 (/MT, /MD)
+        shell: cmd
+        run: |
+          mkdir _tmp\mt _tmp\md
+          rc /fo _tmp\aimg64.res /i src src\aimg.rc
+          if errorlevel 1 exit /b 1
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\mt\\" /Fe:"_tmp\mt\aimg.wdx64" /link /DEF:src\aimg.def _tmp\aimg64.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+          if errorlevel 1 exit /b 1
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MD /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\md\\" /Fe:"_tmp\md\aimg.wdx64" /link /DEF:src\aimg.def _tmp\aimg64.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+          if errorlevel 1 exit /b 1
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build x86 (/MT, /MD)
+        shell: cmd
+        run: |
+          rc /fo _tmp\aimg32.res /i src src\aimg.rc
+          if errorlevel 1 exit /b 1
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\mt\\" /Fe:"_tmp\mt\aimg.wdx" /link /DEF:src\aimg.def _tmp\aimg32.res /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+          if errorlevel 1 exit /b 1
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MD /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\md\\" /Fe:"_tmp\md\aimg.wdx" /link /DEF:src\aimg.def _tmp\aimg32.res /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+          if errorlevel 1 exit /b 1
+
+      - name: Package installer archives
+        shell: cmd
+        run: |
+          mkdir build
+          tar -a -c -f build\aimg.wdx.zip -C _tmp\mt aimg.wdx aimg.wdx64 -C ..\.. pluginst.inf README.md
+          if errorlevel 1 exit /b 1
+          tar -a -c -f build\aimg-md.wdx.zip -C _tmp\md aimg.wdx aimg.wdx64 -C ..\.. pluginst.inf README.md
+          if errorlevel 1 exit /b 1
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/aimg.wdx.zip
+            build/aimg-md.wdx.zip
+          generate_release_notes: true

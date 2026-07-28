@@ -1,0 +1,28 @@
+# Build directories
+build/
+bin/
+obj/
+
+# Compiled plugin files
+*.wdx
+*.wdx64
+*.dll
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated benchmark sample files
+tests/bench_data/
