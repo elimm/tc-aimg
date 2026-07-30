@@ -187,6 +187,22 @@ public:
             val->type = JsonType::String;
             val->strVal = parseString();
             return val;
+        } else if (src.compare(pos, 9, "-Infinity") == 0) {
+            // Not valid per the JSON spec, but Python's json.dumps (and
+            // therefore ComfyUI, which serializes its execution graph with
+            // it) happily emits bare NaN/Infinity/-Infinity for float('nan')/
+            // float('inf') values (e.g. a LoadImage node's "is_changed": NaN
+            // freshness marker). Left unhandled, this token matches none of
+            // the branches below, so parse() returns nullptr having consumed
+            // NO characters -- the enclosing object/array's loop then sees a
+            // non-','/'}'/']' byte at the same position and aborts early,
+            // silently truncating everything parsed after that point in the
+            // WHOLE document, not just the one offending field.
+            val->type = JsonType::Number; val->numVal = 0.0; pos += 9; return val;
+        } else if (src.compare(pos, 8, "Infinity") == 0) {
+            val->type = JsonType::Number; val->numVal = 0.0; pos += 8; return val;
+        } else if (src.compare(pos, 3, "NaN") == 0) {
+            val->type = JsonType::Number; val->numVal = 0.0; pos += 3; return val;
         } else if (isdigit((unsigned char)c) || c == '-') {
             val->type = JsonType::Number;
             size_t start = pos;
@@ -741,29 +757,73 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
     return "";
 }
 
-// Resolves an API-format node id to its "inputs.text" value -- the exact
-// CLIPTextEncode-shaped node a KSampler's "positive"/"negative" link points
-// at. Preferred over the "first/second CLIPTextEncode found" guess since
-// graphs with more than two text-encode nodes (regional prompting,
-// IP-adapters, etc.) make that guess unreliable.
-std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId) {
+// Resolves an API-format node id to its positive/negative prompt text -- the
+// exact text-encode-shaped node a KSampler's "positive"/"negative" link
+// points at. Preferred over the "first/second text-encode node found" guess
+// since graphs with more than two text-encode nodes (regional prompting,
+// IP-adapters, etc.) make that guess unreliable. Plain CLIPTextEncode-shaped
+// nodes hold a single "text" field; some custom nodes (e.g.
+// TextEncodeMageFlowEdit) instead expose two distinct fields, "prompt" and
+// "negative_prompt", on the SAME node -- isPositive picks between them when
+// "text" isn't present.
+std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId, bool isPositive) {
     if (nodeId.empty()) return "";
     auto it = nodesObj->objVal.find(nodeId);
     if (it == nodesObj->objVal.end() || !it->second) return "";
     const auto* refInputs = it->second->getObj("inputs");
-    if (!refInputs || !refInputs->objVal.count("text")) return "";
-    return ResolveTextField(nodesObj, refInputs->objVal.at("text").get());
+    if (!refInputs) return "";
+    if (refInputs->objVal.count("text")) {
+        return ResolveTextField(nodesObj, refInputs->objVal.at("text").get());
+    }
+    const char* fallbackKey = isPositive ? "prompt" : "negative_prompt";
+    if (refInputs->objVal.count(fallbackKey)) {
+        return ResolveTextField(nodesObj, refInputs->objVal.at(fallbackKey).get());
+    }
+    return "";
 }
 
-// Given a UI-format node, returns the first string found in its
-// widgets_values. Plain CLIPTextEncode has the prompt at index 0; some custom
-// prompt nodes (e.g. LoRA-manager style "Prompt" nodes) prepend a metadata
-// object before the text, so taking index 0 unconditionally would grab the
-// wrong element -- the first *string* element is right either way.
-std::string FirstWidgetString(const JsonValue* node) {
+// Given a UI-format node, returns the first (skip == 0) or the
+// (skip+1)-th string found in its widgets_values. Plain CLIPTextEncode has
+// the prompt at index 0; some custom prompt nodes (e.g. LoRA-manager style
+// "Prompt" nodes) prepend a metadata object before the text, so taking index
+// 0 unconditionally would grab the wrong element -- the first *string*
+// element is right either way. skip == 1 is for a node exposing two
+// CONDITIONING outputs (positive/negative) from two distinct text fields on
+// the SAME node (e.g. TextEncodeMageFlowEdit): resolving both outputs would
+// otherwise return the identical first string for both roles.
+std::string FirstWidgetString(const JsonValue* node, int skip = 0) {
     if (!node || !node->objVal.count("widgets_values") || node->objVal.at("widgets_values")->type != JsonType::Array) return "";
     for (const auto& v : node->objVal.at("widgets_values")->arrVal) {
-        if (v && v->type == JsonType::String && !v->strVal.empty()) return v->strVal;
+        if (v && v->type == JsonType::String && !v->strVal.empty()) {
+            if (skip > 0) { skip--; continue; }
+            return v->strVal;
+        }
+    }
+    return "";
+}
+
+// Looks up a widget-backed input's own value in widgets_values by name, for
+// UI-format nodes with more than one widget-backed text field on the same
+// node (e.g. TextEncodeMageFlowEdit's "prompt"/"negative_prompt") where
+// FirstWidgetString's first/second-string guess can't tell them apart by
+// name. widgets_values only holds entries for widget-backed inputs (an
+// "inputs" entry with a "widget" key), in the same order they're declared in
+// "inputs", so the Nth such entry maps onto widgets_values[N].
+std::string NamedWidgetString(const JsonValue* node, const std::string& widgetName) {
+    if (!node || node->type != JsonType::Object) return "";
+    if (!node->objVal.count("inputs") || node->objVal.at("inputs")->type != JsonType::Array) return "";
+    if (!node->objVal.count("widgets_values") || node->objVal.at("widgets_values")->type != JsonType::Array) return "";
+    const auto& wArr = node->objVal.at("widgets_values")->arrVal;
+    size_t widgetIndex = 0;
+    for (const auto& inp : node->objVal.at("inputs")->arrVal) {
+        if (!inp || inp->type != JsonType::Object || !inp->objVal.count("widget")) continue;
+        if (inp->getStr("name") == widgetName) {
+            if (widgetIndex < wArr.size() && wArr[widgetIndex] && wArr[widgetIndex]->type == JsonType::String) {
+                return wArr[widgetIndex]->strVal;
+            }
+            return "";
+        }
+        widgetIndex++;
     }
     return "";
 }
@@ -778,41 +838,114 @@ std::string FirstWidgetString(const JsonValue* node) {
 // Without this, a UI-format graph with more than one (or, worse, exactly one
 // *negative*) CLIPTextEncode-shaped node falls back to the unreliable "first
 // found = positive" guess and can silently swap prompt/negative_prompt.
+//
+// Every node id and link id is only unique WITHIN one "scope" -- the
+// top-level graph, or one subgraph definition's own nodes/links (ComfyUI's
+// subgraph feature renumbers each subgraph definition's internal ids from
+// scratch, so two distinct subgraph definitions embedded in the same
+// workflow can easily reuse the same small node/link ids). All lookups here
+// are therefore keyed by "scopeId\x1f<id>" -- scopeId is "" for the
+// top-level graph and a subgraph definition's own "id" (e.g. its UUID) for
+// its nodes/links -- so resolving a link never crosses into a different
+// subgraph's namesake id by accident.
 struct UiLinkIndex {
     std::unordered_map<std::string, const JsonValue*> nodesById;
-    std::unordered_map<int64_t, std::string> linkOrigin;
+    std::unordered_map<std::string, std::string> linkOrigin;
+    // A link whose origin is the subgraph's own boundary-input sentinel node
+    // (id matches that subgraph's "inputNode") maps here instead of
+    // linkOrigin -- value is the link's "origin_slot", which indexes both
+    // that subgraph's own "inputs[]" (for the exposed input's name) and, more
+    // importantly, the instantiating node's widgets_values[] (for the real,
+    // CURRENT value -- see TryResolveBoundary). Without this, a promoted
+    // widget (e.g. a prompt/seed exposed at a subgraph's boundary) resolves
+    // to whatever stale/demo value was frozen on the inner node at the
+    // moment its widget got converted into a socket, not the value actually
+    // used to generate the image.
+    std::unordered_map<std::string, int> boundarySlot;
 };
+
+std::string ScopedKey(const std::string& scopeId, const std::string& id) {
+    return scopeId + '\x1f' + id;
+}
+
+// One subgraph definition plus (heuristically) the node that instantiates
+// it. A subgraph definition can in principle be instantiated more than once
+// in the same workflow, but ComfyUI's serialized JSON gives no way to tell
+// which instance a given copy of the shared internal node/link template
+// "belongs" to at parse time (no execution-time context available here) --
+// the first top-level instance node found for a given subgraph id is used
+// for every promoted-widget resolution against that subgraph. Correct for
+// the overwhelming majority of real workflows (one instance per subgraph
+// type); a workflow that genuinely instantiates the same subgraph twice with
+// different inputs could have its promoted values misattributed between the
+// two calls.
+struct SubgraphInfo {
+    const JsonValue* def = nullptr;
+    const JsonValue* instanceNode = nullptr;
+};
+using SubgraphRegistry = std::unordered_map<std::string, SubgraphInfo>;
 
 // Follows a UI-format link id to the node that originates it. Returns
 // nullptr if the link or its origin node is unknown, so callers can just
 // early-return on a null result instead of repeating the two-step lookup.
-const JsonValue* ResolveLinkNode(int64_t linkId, const UiLinkIndex& index) {
-    auto it = index.linkOrigin.find(linkId);
+const JsonValue* ResolveLinkNode(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index) {
+    auto it = index.linkOrigin.find(ScopedKey(scopeId, std::to_string(linkId)));
     if (it == index.linkOrigin.end()) return nullptr;
     auto nodeIt = index.nodesById.find(it->second);
     if (nodeIt == index.nodesById.end()) return nullptr;
     return nodeIt->second;
 }
 
-void CollectUiNodesAndLinks(const JsonValue* scope, UiLinkIndex& index) {
+// Resolves a link that crosses a subgraph boundary (see
+// UiLinkIndex::boundarySlot) to the real, current value: the instantiating
+// node's widgets_values at that boundary slot. Returns nullptr if the link
+// isn't a boundary link, the owning subgraph has no located instance node,
+// or the slot is out of range -- callers fall back to the node's own
+// (possibly stale) local value/positional read in all of those cases.
+const JsonValue* TryResolveBoundary(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index,
+                                     const SubgraphRegistry& registry) {
+    auto slotIt = index.boundarySlot.find(ScopedKey(scopeId, std::to_string(linkId)));
+    if (slotIt == index.boundarySlot.end()) return nullptr;
+    auto regIt = registry.find(scopeId);
+    if (regIt == registry.end() || !regIt->second.instanceNode) return nullptr;
+    const JsonValue* inst = regIt->second.instanceNode;
+    if (!inst->objVal.count("widgets_values") || inst->objVal.at("widgets_values")->type != JsonType::Array) return nullptr;
+    const auto& wArr = inst->objVal.at("widgets_values")->arrVal;
+    int slot = slotIt->second;
+    if (slot < 0 || slot >= (int)wArr.size() || !wArr[slot]) return nullptr;
+    return wArr[slot].get();
+}
+
+void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, UiLinkIndex& index) {
     if (!scope || scope->type != JsonType::Object) return;
     if (scope->objVal.count("nodes") && scope->objVal.at("nodes")->type == JsonType::Array) {
         for (const auto& n : scope->objVal.at("nodes")->arrVal) {
             if (!n || n->type != JsonType::Object || !n->objVal.count("id")) continue;
             std::string idStr = JsonIdToString(n->objVal.at("id").get());
-            if (!idStr.empty()) index.nodesById[idStr] = n.get();
+            if (!idStr.empty()) index.nodesById[ScopedKey(scopeId, idStr)] = n.get();
         }
+    }
+    // A subgraph definition's own boundary-input sentinel node id (e.g.
+    // "-10"): links originating there are promoted-widget crossings, routed
+    // to boundarySlot instead of being treated as an ordinary node-to-node
+    // link. Top-level graphs have no "inputNode".
+    std::string boundaryInputId;
+    if (const auto* inputNode = scope->getObj("inputNode")) {
+        if (inputNode->objVal.count("id")) boundaryInputId = JsonIdToString(inputNode->objVal.at("id").get());
     }
     if (scope->objVal.count("links") && scope->objVal.at("links")->type == JsonType::Array) {
         for (const auto& l : scope->objVal.at("links")->arrVal) {
             if (!l) continue;
+            int64_t linkId = 0;
+            std::string originId;
+            int originSlot = -1;
             if (l->type == JsonType::Array) {
                 // Classic ComfyUI link tuple: [link_id, origin_node_id,
                 // origin_slot, target_node_id, target_slot, type].
                 if (l->arrVal.size() < 2 || !l->arrVal[0] || l->arrVal[0]->type != JsonType::Number || !l->arrVal[1]) continue;
-                int64_t linkId = (int64_t)l->arrVal[0]->numVal;
-                std::string originId = JsonIdToString(l->arrVal[1].get());
-                if (!originId.empty()) index.linkOrigin[linkId] = originId;
+                linkId = (int64_t)l->arrVal[0]->numVal;
+                originId = JsonIdToString(l->arrVal[1].get());
+                if (l->arrVal.size() > 2 && l->arrVal[2] && l->arrVal[2]->type == JsonType::Number) originSlot = (int)l->arrVal[2]->numVal;
             } else if (l->type == JsonType::Object) {
                 // Newer subgraph-capable ComfyUI versions instead store each
                 // link as an object: {"id": 40, "origin_id": 28,
@@ -824,17 +957,23 @@ void CollectUiNodesAndLinks(const JsonValue* scope, UiLinkIndex& index) {
                 const auto& idv = l->objVal.at("id");
                 const auto& originv = l->objVal.at("origin_id");
                 if (!idv || idv->type != JsonType::Number || !originv) continue;
-                int64_t linkId = (int64_t)idv->numVal;
-                std::string originId = JsonIdToString(originv.get());
-                if (!originId.empty()) index.linkOrigin[linkId] = originId;
+                linkId = (int64_t)idv->numVal;
+                originId = JsonIdToString(originv.get());
+                if (l->objVal.count("origin_slot") && l->objVal.at("origin_slot") && l->objVal.at("origin_slot")->type == JsonType::Number) {
+                    originSlot = (int)l->objVal.at("origin_slot")->numVal;
+                }
+            } else {
+                continue;
+            }
+            if (originId.empty()) continue;
+            std::string linkKey = ScopedKey(scopeId, std::to_string(linkId));
+            if (!boundaryInputId.empty() && originId == boundaryInputId && originSlot >= 0) {
+                index.boundarySlot[linkKey] = originSlot;
+            } else {
+                index.linkOrigin[linkKey] = ScopedKey(scopeId, originId);
             }
         }
     }
-}
-
-std::string ResolveUiLinkText(int64_t linkId, const UiLinkIndex& index) {
-    const JsonValue* node = ResolveLinkNode(linkId, index);
-    return node ? FirstWidgetString(node) : "";
 }
 
 // Looks up a named input's "link" id on a UI-format node (inputs is an array
@@ -854,16 +993,17 @@ bool GetNodeInputLink(const JsonValue* node, const std::string& name, int64_t& o
     return false;
 }
 
-std::string ResolveUiTextThroughLink(int64_t linkId, const UiLinkIndex& index, int depth);
+std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index,
+                                      const SubgraphRegistry& registry, int depth);
 
 // Resolves a boolean-valued UI link (e.g. a ComfySwitchNode's own "switch"
 // input) to its literal true/false, following PrimitiveBoolean nodes.
 // Returns -1 when the value can't be determined (unknown node type, missing
 // link, or a non-boolean widget) so callers can fall back to a node's own
 // widgets_values default instead of guessing.
-int ResolveUiBoolLink(int64_t linkId, const UiLinkIndex& index, int depth) {
+int ResolveUiBoolLink(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index, int depth) {
     if (depth > 6) return -1;
-    const JsonValue* node = ResolveLinkNode(linkId, index);
+    const JsonValue* node = ResolveLinkNode(scopeId, linkId, index);
     if (!node) return -1;
     if (!node->objVal.count("widgets_values") || node->objVal.at("widgets_values")->type != JsonType::Array) return -1;
     const auto& w = node->objVal.at("widgets_values")->arrVal;
@@ -876,17 +1016,25 @@ int ResolveUiBoolLink(int64_t linkId, const UiLinkIndex& index, int depth) {
 // StringConcatenate, ComfySwitchNode) to the literal text feeding it --
 // prompt-enhancement/LoRA-trigger workflows route text through several of
 // these, leaving widgets_values[0] a stale placeholder otherwise. Bounded
-// depth guards against cycles in malformed graphs.
-std::string ResolveUiTextThroughLink(int64_t linkId, const UiLinkIndex& index, int depth) {
+// depth guards against cycles in malformed graphs. Also checks, before
+// anything else, whether this link crosses a subgraph boundary (see
+// TryResolveBoundary) -- a promoted text widget's real value lives on the
+// subgraph's instantiating node, not on whatever node the link nominally
+// points at inside the subgraph.
+std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index,
+                                      const SubgraphRegistry& registry, int depth) {
     if (depth > 6) return "";
-    const JsonValue* node = ResolveLinkNode(linkId, index);
+    if (const JsonValue* boundaryVal = TryResolveBoundary(scopeId, linkId, index, registry)) {
+        return boundaryVal->type == JsonType::String ? boundaryVal->strVal : "";
+    }
+    const JsonValue* node = ResolveLinkNode(scopeId, linkId, index);
     if (!node) return "";
     std::string typeStr = node->getStr("type");
 
     if (typeStr == "ComfySwitchNode") {
         int switchVal = -1;
         int64_t switchLink = 0;
-        if (GetNodeInputLink(node, "switch", switchLink)) switchVal = ResolveUiBoolLink(switchLink, index, depth + 1);
+        if (GetNodeInputLink(node, "switch", switchLink)) switchVal = ResolveUiBoolLink(scopeId, switchLink, index, depth + 1);
         if (switchVal == -1 && node->objVal.count("widgets_values") && node->objVal.at("widgets_values")->type == JsonType::Array) {
             const auto& w = node->objVal.at("widgets_values")->arrVal;
             if (!w.empty() && w[0] && w[0]->type == JsonType::Bool) switchVal = w[0]->boolVal ? 1 : 0;
@@ -903,24 +1051,24 @@ std::string ResolveUiTextThroughLink(int64_t linkId, const UiLinkIndex& index, i
         if (switchVal != -1) {
             const char* branchName = switchVal == 1 ? "on_true" : "on_false";
             if (GetNodeInputLink(node, branchName, branchLink)) {
-                std::string r = ResolveUiTextThroughLink(branchLink, index, depth + 1);
+                std::string r = ResolveUiTextThroughLink(scopeId, branchLink, index, registry, depth + 1);
                 if (!r.empty()) return r;
             }
         }
         if (GetNodeInputLink(node, "on_true", branchLink)) {
-            std::string r = ResolveUiTextThroughLink(branchLink, index, depth + 1);
+            std::string r = ResolveUiTextThroughLink(scopeId, branchLink, index, registry, depth + 1);
             if (!r.empty()) return r;
         }
         if (GetNodeInputLink(node, "on_false", branchLink)) {
-            return ResolveUiTextThroughLink(branchLink, index, depth + 1);
+            return ResolveUiTextThroughLink(scopeId, branchLink, index, registry, depth + 1);
         }
         return "";
     }
 
     if (typeStr == "StringConcatenate") {
         int64_t aLink, bLink;
-        std::string a = GetNodeInputLink(node, "string_a", aLink) ? ResolveUiTextThroughLink(aLink, index, depth + 1) : "";
-        std::string b = GetNodeInputLink(node, "string_b", bLink) ? ResolveUiTextThroughLink(bLink, index, depth + 1) : "";
+        std::string a = GetNodeInputLink(node, "string_a", aLink) ? ResolveUiTextThroughLink(scopeId, aLink, index, registry, depth + 1) : "";
+        std::string b = GetNodeInputLink(node, "string_b", bLink) ? ResolveUiTextThroughLink(scopeId, bLink, index, registry, depth + 1) : "";
         std::string sep;
         if (node->objVal.count("widgets_values") && node->objVal.at("widgets_values")->type == JsonType::Array) {
             const auto& w = node->objVal.at("widgets_values")->arrVal;
@@ -934,14 +1082,14 @@ std::string ResolveUiTextThroughLink(int64_t linkId, const UiLinkIndex& index, i
     if (typeStr == "Reroute" || typeStr == "PreviewAny") {
         int64_t srcLink;
         if (GetNodeInputLink(node, "source", srcLink) || GetNodeInputLink(node, "value", srcLink)) {
-            return ResolveUiTextThroughLink(srcLink, index, depth + 1);
+            return ResolveUiTextThroughLink(scopeId, srcLink, index, registry, depth + 1);
         }
         if (node->objVal.count("inputs") && node->objVal.at("inputs")->type == JsonType::Array &&
             !node->objVal.at("inputs")->arrVal.empty()) {
             const auto& inp0 = node->objVal.at("inputs")->arrVal[0];
             if (inp0 && inp0->type == JsonType::Object && inp0->objVal.count("link") &&
                 inp0->objVal.at("link") && inp0->objVal.at("link")->type == JsonType::Number) {
-                return ResolveUiTextThroughLink((int64_t)inp0->objVal.at("link")->numVal, index, depth + 1);
+                return ResolveUiTextThroughLink(scopeId, (int64_t)inp0->objVal.at("link")->numVal, index, registry, depth + 1);
             }
         }
         return "";
@@ -961,6 +1109,33 @@ std::string ResolveUiTextThroughLink(int64_t linkId, const UiLinkIndex& index, i
         return FirstWidgetString(node);
     }
     return "";
+}
+
+// Resolves a KSampler-type node's "positive"/"negative" CONDITIONING link to
+// the origin node's actual text. The origin node's own "text" (or, for
+// dual-role nodes like TextEncodeMageFlowEdit, "prompt"/"negative_prompt")
+// field may itself be linked -- directly, through pass-through nodes, or
+// promoted to a subgraph boundary -- rather than a plain local widget, so
+// this must resolve through ResolveUiTextThroughLink the same way the
+// CLIPTextEncode/TextEncode traversal branch does, instead of blindly taking
+// FirstWidgetString() of the origin node (which would silently prefer a
+// stale/demo widgets_values entry over the real, current value whenever one
+// happens to be linked over).
+std::string ResolveUiLinkText(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index,
+                               const SubgraphRegistry& registry, bool wantNegative, int skip = 0) {
+    const JsonValue* node = ResolveLinkNode(scopeId, linkId, index);
+    if (!node) return "";
+    int64_t fieldLink;
+    if (GetNodeInputLink(node, "text", fieldLink)) {
+        std::string t = ResolveUiTextThroughLink(scopeId, fieldLink, index, registry, 0);
+        if (!t.empty()) return t;
+    }
+    const char* namedField = wantNegative ? "negative_prompt" : "prompt";
+    if (GetNodeInputLink(node, namedField, fieldLink)) {
+        std::string t = ResolveUiTextThroughLink(scopeId, fieldLink, index, registry, 0);
+        if (!t.empty()) return t;
+    }
+    return FirstWidgetString(node, skip);
 }
 
 // Positional offsets into a UI-format node's widgets_values array, for node
@@ -999,8 +1174,54 @@ const std::unordered_map<std::string, WidgetFieldMap>& GetWidgetFieldMaps() {
     return kMaps;
 }
 
-void ApplyWidgetFieldMap(const WidgetFieldMap& m, const std::vector<std::shared_ptr<JsonValue>>& wArr,
+// Attempts to resolve a node's named input to a value crossing a subgraph
+// boundary (see TryResolveBoundary) before any positional widgets_values
+// fallback is tried. A KSampler-family node's seed/steps/cfg/sampler/
+// scheduler widget can just as easily be promoted to a subgraph boundary
+// input as a CLIPTextEncode's "text" -- in that case the node's own
+// widgets_values entry is a frozen leftover from before the widget was
+// converted to a socket, not the value actually used.
+bool TryBoundaryNumber(const JsonValue* node, const char* inputName, const std::string& scopeId,
+                       const UiLinkIndex& index, const SubgraphRegistry& registry, double& outNum) {
+    int64_t linkId;
+    if (!GetNodeInputLink(node, inputName, linkId)) return false;
+    const JsonValue* v = TryResolveBoundary(scopeId, linkId, index, registry);
+    if (!v || v->type != JsonType::Number) return false;
+    outNum = v->numVal;
+    return true;
+}
+
+bool TryBoundaryString(const JsonValue* node, const char* inputName, const std::string& scopeId,
+                        const UiLinkIndex& index, const SubgraphRegistry& registry, std::string& outStr) {
+    int64_t linkId;
+    if (!GetNodeInputLink(node, inputName, linkId)) return false;
+    const JsonValue* v = TryResolveBoundary(scopeId, linkId, index, registry);
+    if (!v || v->type != JsonType::String) return false;
+    outStr = v->strVal;
+    return true;
+}
+
+void ApplyWidgetFieldMap(const JsonValue* node, const WidgetFieldMap& m, const std::vector<std::shared_ptr<JsonValue>>& wArr,
+                          const std::string& scopeId, const UiLinkIndex& index, const SubgraphRegistry& registry,
                           AImgInfo& info, std::string& samplerName, std::string& schedulerName) {
+    double num;
+    if (!info.has_seed && (TryBoundaryNumber(node, "seed", scopeId, index, registry, num) ||
+                           TryBoundaryNumber(node, "noise_seed", scopeId, index, registry, num))) {
+        info.seed = (int64_t)num; info.has_seed = true;
+    }
+    if (!info.has_steps && TryBoundaryNumber(node, "steps", scopeId, index, registry, num)) {
+        info.steps = (int32_t)num; info.has_steps = true;
+    }
+    if (!info.has_cfg && TryBoundaryNumber(node, "cfg", scopeId, index, registry, num)) {
+        info.cfg_scale = num; info.has_cfg = true;
+    }
+    if (!info.has_denoising_strength && TryBoundaryNumber(node, "denoise", scopeId, index, registry, num)) {
+        info.denoising_strength = num; info.has_denoising_strength = true;
+    }
+    std::string str;
+    if (samplerName.empty() && TryBoundaryString(node, "sampler_name", scopeId, index, registry, str)) samplerName = str;
+    if (schedulerName.empty() && TryBoundaryString(node, "scheduler", scopeId, index, registry, str)) schedulerName = str;
+
     if ((int)wArr.size() < m.minSize) return;
     auto numAt = [&](int idx) -> const JsonValue* {
         if (idx < 0 || idx >= (int)wArr.size() || !wArr[idx]) return nullptr;
@@ -1029,16 +1250,37 @@ struct ComfyUiExtraction {
     std::string uiResolvedPos, uiResolvedNeg;
 };
 
+// A UI-format node's "mode" is an editor-only run-state flag ComfyUI
+// preserves in the saved workflow regardless of whether the node actually
+// participates in generation: 0 = enabled (the default when absent), 2 =
+// muted, 4 = bypassed. Muted/bypassed nodes -- and, by extension, whole
+// subgraph instances left disabled after being used for a previous edit
+// step, an alternate draft branch, or an XY-grid/experiment helper -- are
+// NOT part of the actual execution and must not contribute prompt/negative
+// prompt/seed/etc. text just because they still physically appear in
+// "nodes[]"/a subgraph definition. Unlike the API/"prompt" execution-graph
+// format (which ComfyUI already excludes disabled nodes from at queue time),
+// the UI/"workflow" format keeps everything the editor last had open.
+bool IsNodeDisabled(const JsonValue* node) {
+    if (!node || node->type != JsonType::Object) return false;
+    if (!node->objVal.count("mode")) return false;
+    const auto& m = node->objVal.at("mode");
+    if (!m || m->type != JsonType::Number) return false;
+    int mode = (int)m->numVal;
+    return mode == 2 || mode == 4;
+}
+
 // UI Graph Format traversal of one "nodes" array. Called both for the
 // top-level "nodes" array and for each subgraph definition's own "nodes"
 // array -- ComfyUI's subgraph feature moves the actual
 // KSampler/CLIPTextEncode/etc. nodes out of the top-level list into
 // definitions.subgraphs[].nodes, with the top level holding only opaque
 // subgraph-instance placeholder nodes.
-void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray,
-                      const UiLinkIndex& linkIndex, AImgInfo& info, ComfyUiExtraction& out) {
+void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray, const std::string& scopeId,
+                      const UiLinkIndex& linkIndex, const SubgraphRegistry& registry, AImgInfo& info, ComfyUiExtraction& out) {
     for (const auto& item : nodesArray) {
         if (!item || item->type != JsonType::Object) continue;
+        if (IsNodeDisabled(item.get())) continue;
         std::string typeStr = item->getStr("type");
 
         // UI-format "inputs" is an array of {name, type, link} objects
@@ -1047,15 +1289,30 @@ void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray,
         // way regardless of that node's own type (KSampler, KSamplerAdvanced,
         // CFGGuider, ...).
         if (item->objVal.count("inputs") && item->objVal.at("inputs")->type == JsonType::Array) {
+            int64_t posLinkId = 0, negLinkId = 0;
+            bool hasPosLink = false, hasNegLink = false;
             for (const auto& inp : item->objVal.at("inputs")->arrVal) {
                 if (!inp || inp->type != JsonType::Object) continue;
                 std::string inName = inp->getStr("name");
                 if (inName != "positive" && inName != "negative") continue;
                 if (!inp->objVal.count("link") || !inp->objVal.at("link") || inp->objVal.at("link")->type != JsonType::Number) continue;
-                std::string resolved = ResolveUiLinkText((int64_t)inp->objVal.at("link")->numVal, linkIndex);
-                if (resolved.empty()) continue;
-                if (inName == "positive" && out.uiResolvedPos.empty()) out.uiResolvedPos = resolved;
-                else if (inName == "negative" && out.uiResolvedNeg.empty()) out.uiResolvedNeg = resolved;
+                int64_t linkId = (int64_t)inp->objVal.at("link")->numVal;
+                if (inName == "positive") { posLinkId = linkId; hasPosLink = true; }
+                else { negLinkId = linkId; hasNegLink = true; }
+            }
+            if (hasPosLink) {
+                std::string resolved = ResolveUiLinkText(scopeId, posLinkId, linkIndex, registry, /*wantNegative=*/false);
+                if (!resolved.empty() && out.uiResolvedPos.empty()) out.uiResolvedPos = resolved;
+            }
+            if (hasNegLink) {
+                // If positive and negative both link into the SAME origin node --
+                // a custom node exposing two CONDITIONING outputs from two
+                // distinct text fields, e.g. TextEncodeMageFlowEdit -- the
+                // first-non-empty-string guess used for positive would return the
+                // identical text for negative too; skip past it to the next one.
+                bool sameOriginAsPositive = hasPosLink && ResolveLinkNode(scopeId, posLinkId, linkIndex) == ResolveLinkNode(scopeId, negLinkId, linkIndex);
+                std::string resolved = ResolveUiLinkText(scopeId, negLinkId, linkIndex, registry, /*wantNegative=*/true, sameOriginAsPositive ? 1 : 0);
+                if (!resolved.empty() && out.uiResolvedNeg.empty()) out.uiResolvedNeg = resolved;
             }
         }
 
@@ -1067,37 +1324,75 @@ void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray,
         if (!item->objVal.count("widgets_values") || item->objVal.at("widgets_values")->type != JsonType::Array) continue;
         const auto& wArr = item->objVal.at("widgets_values")->arrVal;
 
-        if (typeStr == "CLIPTextEncode") {
+        if (typeStr == "CLIPTextEncode" || typeStr.find("TextEncode") != std::string::npos) {
             std::string text;
             int64_t textLink;
             // The "text" widget may have been converted to a wired input
-            // socket (prompt-enhancement/LoRA-trigger workflows commonly do
-            // this) -- in that case widgets_values[0] is a stale leftover
-            // from before the conversion, not the text actually used, so
-            // prefer following the link over the raw widget value.
+            // socket (prompt-enhancement/LoRA-trigger workflows, or a
+            // subgraph promoting it to its own boundary, commonly do this)
+            // -- in that case widgets_values[0] is a stale leftover from
+            // before the conversion, not the text actually used, so prefer
+            // following the link over the raw widget value.
             if (GetNodeInputLink(item.get(), "text", textLink)) {
-                text = ResolveUiTextThroughLink(textLink, linkIndex, 0);
+                text = ResolveUiTextThroughLink(scopeId, textLink, linkIndex, registry, 0);
+            }
+            // Custom nodes exposing separate "prompt"/"negative_prompt" fields
+            // on the SAME node (e.g. TextEncodeMageFlowEdit) rather than a
+            // shared "text" -- each may itself be linked (directly, or
+            // promoted to a subgraph boundary) rather than a plain local
+            // widget, so resolve through the link BEFORE falling back to
+            // wArr[0]/the node's own local widget value below -- checking the
+            // raw widgets_values first would grab a stale linked-over value
+            // whenever one happens to be present.
+            std::string negFromNamedField;
+            int64_t negLink;
+            if (GetNodeInputLink(item.get(), "negative_prompt", negLink)) {
+                negFromNamedField = ResolveUiTextThroughLink(scopeId, negLink, linkIndex, registry, 0);
+            }
+            if (text.empty()) {
+                int64_t promptLink;
+                if (GetNodeInputLink(item.get(), "prompt", promptLink)) {
+                    text = ResolveUiTextThroughLink(scopeId, promptLink, linkIndex, registry, 0);
+                }
             }
             if (text.empty() && !wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
                 text = wArr[0]->strVal;
             }
+            if (negFromNamedField.empty()) negFromNamedField = NamedWidgetString(item.get(), "negative_prompt");
+            if (text.empty()) text = NamedWidgetString(item.get(), "prompt");
             if (!text.empty()) {
                 if (out.posPromptText.empty()) out.posPromptText = text;
                 else if (out.negPromptText.empty()) out.negPromptText = text;
             }
-        } else if ((typeStr == "Load Checkpoint" || typeStr.find("CheckpointLoader") != std::string::npos ||
-                    typeStr.find("UNETLoader") != std::string::npos || typeStr.find("DiffusionModelLoader") != std::string::npos) &&
-                   !wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
-            if (out.modelName.empty()) out.modelName = wArr[0]->strVal;
-        } else if (typeStr == "VAELoader" && !wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
-            if (out.vaeName.empty()) out.vaeName = wArr[0]->strVal;
+            if (!negFromNamedField.empty() && out.negPromptText.empty()) out.negPromptText = negFromNamedField;
+        } else if (typeStr == "Load Checkpoint" || typeStr.find("CheckpointLoader") != std::string::npos ||
+                   typeStr.find("UNETLoader") != std::string::npos || typeStr.find("DiffusionModelLoader") != std::string::npos) {
+            std::string name;
+            if (out.modelName.empty()) {
+                if (TryBoundaryString(item.get(), "ckpt_name", scopeId, linkIndex, registry, name) ||
+                    TryBoundaryString(item.get(), "unet_name", scopeId, linkIndex, registry, name) ||
+                    TryBoundaryString(item.get(), "model_name", scopeId, linkIndex, registry, name)) {
+                    out.modelName = name;
+                } else if (!wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
+                    out.modelName = wArr[0]->strVal;
+                }
+            }
+        } else if (typeStr == "VAELoader") {
+            std::string name;
+            if (out.vaeName.empty()) {
+                if (TryBoundaryString(item.get(), "vae_name", scopeId, linkIndex, registry, name)) {
+                    out.vaeName = name;
+                } else if (!wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
+                    out.vaeName = wArr[0]->strVal;
+                }
+            }
         } else {
             // Standard fixed-position generation-parameter node types
             // (KSampler and its custom-sampler-pipeline siblings): looked up
             // in the table above instead of a long if/else-if chain.
             auto it = GetWidgetFieldMaps().find(typeStr);
             if (it != GetWidgetFieldMaps().end()) {
-                ApplyWidgetFieldMap(it->second, wArr, info, out.samplerName, out.schedulerName);
+                ApplyWidgetFieldMap(item.get(), it->second, wArr, scopeId, linkIndex, registry, info, out.samplerName, out.schedulerName);
             }
         }
     }
@@ -1201,11 +1496,28 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             }
         }
 
-        if (classType == "CLIPTextEncode" || classType == "BNK_CLIPTextEncodeAdvanced" || classType.find("Prompt") != std::string::npos) {
-            std::string text = inputs->objVal.count("text") ? ResolveTextField(nodesObj, inputs->objVal.at("text").get()) : "";
-            if (!text.empty()) {
-                if (ui.posPromptText.empty()) ui.posPromptText = text;
-                else if (ui.negPromptText.empty()) ui.negPromptText = text;
+        if (classType == "CLIPTextEncode" || classType == "BNK_CLIPTextEncodeAdvanced" ||
+            classType.find("Prompt") != std::string::npos || classType.find("TextEncode") != std::string::npos) {
+            if (inputs->objVal.count("text")) {
+                std::string text = ResolveTextField(nodesObj, inputs->objVal.at("text").get());
+                if (!text.empty()) {
+                    if (ui.posPromptText.empty()) ui.posPromptText = text;
+                    else if (ui.negPromptText.empty()) ui.negPromptText = text;
+                }
+            } else {
+                // Custom nodes exposing separate "prompt"/"negative_prompt"
+                // fields on the SAME node (e.g. TextEncodeMageFlowEdit)
+                // instead of a shared "text" -- read both by name rather than
+                // the encounter-order guess above, which would otherwise only
+                // ever see one of the two fields on such a node.
+                if (ui.posPromptText.empty() && inputs->objVal.count("prompt")) {
+                    std::string t = ResolveTextField(nodesObj, inputs->objVal.at("prompt").get());
+                    if (!t.empty()) ui.posPromptText = t;
+                }
+                if (ui.negPromptText.empty() && inputs->objVal.count("negative_prompt")) {
+                    std::string t = ResolveTextField(nodesObj, inputs->objVal.at("negative_prompt").get());
+                    if (!t.empty()) ui.negPromptText = t;
+                }
             }
         }
 
@@ -1244,24 +1556,66 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     // into the KSampler's "positive"/"negative" inputs over the "first/second
     // found" guess above, since graphs with more than two text-encode nodes
     // (regional prompting, IP-adapters, etc.) make that guess unreliable.
-    std::string resolvedPos = ResolveClipText(nodesObj, positiveNodeId);
-    std::string resolvedNeg = ResolveClipText(nodesObj, negativeNodeId);
+    std::string resolvedPos = ResolveClipText(nodesObj, positiveNodeId, /*isPositive=*/true);
+    std::string resolvedNeg = ResolveClipText(nodesObj, negativeNodeId, /*isPositive=*/false);
     if (!resolvedPos.empty()) ui.posPromptText = resolvedPos;
     if (!resolvedNeg.empty()) ui.negPromptText = resolvedNeg;
 
-    // UI-format node/link index, built up-front (before widget extraction) --
-    // see UiLinkIndex/CollectUiNodesAndLinks above.
-    UiLinkIndex linkIndex;
-    CollectUiNodesAndLinks(nodesObj, linkIndex);
-    if (const auto* uiDefs = nodesObj->getObj("definitions")) {
-        if (uiDefs->objVal.count("subgraphs")) {
-            const auto* uiSubgraphsVal = uiDefs->objVal.at("subgraphs").get();
-            if (uiSubgraphsVal && uiSubgraphsVal->type == SimpleJson::JsonType::Array) {
-                for (const auto& sg : uiSubgraphsVal->arrVal) CollectUiNodesAndLinks(sg.get(), linkIndex);
-            } else if (uiSubgraphsVal && uiSubgraphsVal->type == SimpleJson::JsonType::Object) {
-                for (const auto& kv3 : uiSubgraphsVal->objVal) CollectUiNodesAndLinks(kv3.second.get(), linkIndex);
+    // Collect every subgraph definition up front (handles both the array and
+    // legacy object-map serialization of definitions.subgraphs), then locate
+    // each one's instantiating node in the top-level "nodes" array --
+    // first-match heuristic; see SubgraphRegistry -- before any traversal, so
+    // promoted-widget resolution always has somewhere to look up the real
+    // (current) value instead of a stale one frozen inside the subgraph.
+    std::vector<const SimpleJson::JsonValue*> subgraphDefs;
+    if (const auto* defs = nodesObj->getObj("definitions")) {
+        if (defs->objVal.count("subgraphs")) {
+            const auto* sgVal = defs->objVal.at("subgraphs").get();
+            if (sgVal && sgVal->type == SimpleJson::JsonType::Array) {
+                for (const auto& sg : sgVal->arrVal) if (sg) subgraphDefs.push_back(sg.get());
+            } else if (sgVal && sgVal->type == SimpleJson::JsonType::Object) {
+                for (const auto& kv : sgVal->objVal) if (kv.second) subgraphDefs.push_back(kv.second.get());
             }
         }
+    }
+
+    SubgraphRegistry registry;
+    for (const auto* sg : subgraphDefs) {
+        if (!sg || sg->type != SimpleJson::JsonType::Object || !sg->objVal.count("id")) continue;
+        std::string sgId = JsonIdToString(sg->objVal.at("id").get());
+        if (!sgId.empty()) registry[sgId].def = sg;
+    }
+    if (nodesObj->objVal.count("nodes") && nodesObj->objVal.at("nodes")->type == SimpleJson::JsonType::Array) {
+        for (const auto& n : nodesObj->objVal.at("nodes")->arrVal) {
+            if (!n || n->type != SimpleJson::JsonType::Object) continue;
+            auto regIt = registry.find(n->getStr("type"));
+            if (regIt != registry.end() && !regIt->second.instanceNode) regIt->second.instanceNode = n.get();
+        }
+    }
+
+    // A subgraph whose instantiating node is missing (defined but never
+    // actually placed in the graph -- e.g. a leftover/unused template) or
+    // disabled (mode 2/4 -- see IsNodeDisabled) contributes nothing to the
+    // actual generation: skip it entirely, for both link collection and
+    // widget traversal, rather than let its internal CLIPTextEncode/KSampler
+    // nodes -- an inactive alternate-edit-step branch, XY-grid experiment,
+    // etc. -- pollute prompt/negative_prompt/seed via the "any node found
+    // anywhere in the document" traversal below.
+    auto subgraphInstanceActive = [&](const std::string& sgId) {
+        auto it = registry.find(sgId);
+        return it != registry.end() && it->second.instanceNode && !IsNodeDisabled(it->second.instanceNode);
+    };
+
+    // UI-format node/link index, built up-front (before widget extraction) --
+    // see UiLinkIndex/CollectUiNodesAndLinks above. Top-level graph uses scope
+    // id "" ; each subgraph definition uses its own "id" as scope, since node
+    // ids and link ids are only unique WITHIN one scope.
+    UiLinkIndex linkIndex;
+    CollectUiNodesAndLinks(nodesObj, "", linkIndex);
+    for (const auto* sg : subgraphDefs) {
+        std::string sgId = (sg->objVal.count("id")) ? JsonIdToString(sg->objVal.at("id").get()) : "";
+        if (!subgraphInstanceActive(sgId)) continue;
+        CollectUiNodesAndLinks(sg, sgId, linkIndex);
     }
 
     // 2. UI Graph Format Traversal ("nodes" array), plus subgraph definitions
@@ -1270,23 +1624,13 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     // out of the top-level list into there, with the top level holding only
     // opaque subgraph-instance placeholder nodes.
     if (nodesObj->objVal.count("nodes") && nodesObj->objVal.at("nodes")->type == SimpleJson::JsonType::Array) {
-        TraverseUiNodes(nodesObj->objVal.at("nodes")->arrVal, linkIndex, info, ui);
+        TraverseUiNodes(nodesObj->objVal.at("nodes")->arrVal, "", linkIndex, registry, info, ui);
     }
-    if (const auto* definitions = nodesObj->getObj("definitions")) {
-        if (definitions->objVal.count("subgraphs")) {
-            const auto* subgraphsVal = definitions->objVal.at("subgraphs").get();
-            auto visitSubgraph = [&](const SimpleJson::JsonValue* sg) {
-                if (!sg || sg->type != SimpleJson::JsonType::Object) return;
-                if (sg->objVal.count("nodes") && sg->objVal.at("nodes")->type == SimpleJson::JsonType::Array) {
-                    TraverseUiNodes(sg->objVal.at("nodes")->arrVal, linkIndex, info, ui);
-                }
-            };
-            if (subgraphsVal && subgraphsVal->type == SimpleJson::JsonType::Array) {
-                for (const auto& sg : subgraphsVal->arrVal) visitSubgraph(sg.get());
-            } else if (subgraphsVal && subgraphsVal->type == SimpleJson::JsonType::Object) {
-                for (const auto& kv2 : subgraphsVal->objVal) visitSubgraph(kv2.second.get());
-            }
-        }
+    for (const auto* sg : subgraphDefs) {
+        if (!sg->objVal.count("nodes") || sg->objVal.at("nodes")->type != SimpleJson::JsonType::Array) continue;
+        std::string sgId = sg->objVal.count("id") ? JsonIdToString(sg->objVal.at("id").get()) : "";
+        if (!subgraphInstanceActive(sgId)) continue;
+        TraverseUiNodes(sg->objVal.at("nodes")->arrVal, sgId, linkIndex, registry, info, ui);
     }
 
     // Link-resolved text wins over the "first/second CLIPTextEncode found"
