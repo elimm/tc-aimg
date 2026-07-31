@@ -11,46 +11,6 @@
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
-// Field definitions
-// ---------------------------------------------------------------------------
-
-struct FieldDef {
-    const wchar_t* name;
-    int type;
-    const wchar_t* units;
-};
-
-static const FieldDef g_Fields[] = {
-    { L"Generator",           ft_stringw,   L"" }, // 0
-    { L"Prompt",              ft_fulltextw, L"" }, // 1
-    { L"Prompt (Short)",      ft_stringw,   L"" }, // 2
-    { L"Negative Prompt",     ft_fulltextw, L"" }, // 3
-    { L"Negative Prompt (Short)", ft_stringw,L"" }, // 4
-    { L"Model",               ft_stringw,   L"" }, // 5
-    { L"Model Hash",          ft_stringw,   L"" }, // 6
-    { L"Seed",                ft_numeric_64,L"" }, // 7
-    { L"CFG Scale",           ft_float,     L"" }, // 8
-    { L"Steps",               ft_numeric_32,L"" }, // 9
-    { L"Sampler",             ft_stringw,   L"" }, // 10
-    { L"Scheduler",           ft_stringw,   L"" }, // 11
-    { L"Clip Skip",           ft_numeric_32,L"" }, // 12
-    { L"Size",                ft_stringw,   L"" }, // 13
-    { L"Aspect Ratio",        ft_stringw,   L"" }, // 14
-    { L"Megapixels",          ft_float,     L"" }, // 15
-    { L"Denoising Strength",  ft_float,     L"" }, // 16
-    { L"Hires Upscale",       ft_stringw,   L"" }, // 17
-    { L"Hires Upscaler",      ft_stringw,   L"" }, // 18
-    { L"Hires Steps",         ft_numeric_32,L"" }, // 19
-    { L"VAE",                 ft_stringw,   L"" }, // 20
-    { L"LoRA",                ft_stringw,   L"" }, // 21
-    { L"LoRA Count",          ft_numeric_32,L"" }, // 22
-    { L"Full Parameters",     ft_fulltextw, L"" }, // 23
-    { L"Has AI Metadata",     ft_boolean,   L"" }  // 24
-};
-
-static const int g_FieldCount = sizeof(g_Fields) / sizeof(g_Fields[0]);
-
-// ---------------------------------------------------------------------------
 // Caching Mechanism for High-Speed Total Commander File Scanning
 // ---------------------------------------------------------------------------
 //
@@ -73,6 +33,9 @@ struct CacheEntry {
     AImgInfo info;
     FILETIME lastWriteTime{};
     ULARGE_INTEGER fileSize{};
+    // Tick count (GetTickCount64) at which lastWriteTime/fileSize were last
+    // refreshed via GetFileAttributesExW. See kStatDebounceMs below.
+    ULONGLONG lastStatTick = 0;
     // At most one ft_fulltextw continuation can be in flight per thread at a
     // time (TC drives one field-query sequence to completion before starting
     // another), so a single per-thread cursor is enough: fieldIndex identifies
@@ -88,6 +51,16 @@ struct CacheEntry {
 };
 
 static const size_t kCacheCapacity = 4;
+
+// Total Commander queries every field of a file (up to g_FieldCount calls)
+// one after another before moving to the next file, so re-statting on every
+// single field query turns one syscall per file into g_FieldCount syscalls
+// per file. Trusting a just-read stamp for a short window collapses that
+// back to ~one stat per file/row for the common case, at the cost of not
+// noticing an external modification that happens to land inside the window
+// -- an acceptable tradeoff for a plugin driven by interactive column/tooltip
+// queries, not a background integrity scanner.
+static const ULONGLONG kStatDebounceMs = 200;
 
 static std::mutex g_CacheMutex;
 static std::deque<CacheEntry> g_Cache; // front = most recently used
@@ -109,18 +82,35 @@ static bool GetFileStamp(const std::wstring& filePath, FILETIME& outTime, ULARGE
 // holding the lock, avoiding a full AImgInfo copy (~15 std::wstring members)
 // on every single-field query.
 static void EnsureCached(const std::wstring& filePath) {
-    FILETIME writeTime{};
-    ULARGE_INTEGER size{};
-    bool haveStamp = GetFileStamp(filePath, writeTime, size);
+    ULONGLONG now = GetTickCount64();
 
     for (auto it = g_Cache.begin(); it != g_Cache.end(); ++it) {
         if (_wcsicmp(it->path.c_str(), filePath.c_str()) != 0) continue; // Windows paths are case-insensitive
-        // A path match is only a real hit if the file hasn't changed on disk
-        // since it was cached (e.g. re-saved by another tool between two
-        // field queries for the same row); otherwise fall through and re-parse.
-        bool stale = !haveStamp ||
-                     CompareFileTime(&it->lastWriteTime, &writeTime) != 0 ||
-                     it->fileSize.QuadPart != size.QuadPart;
+
+        // Within the debounce window, trust the stamp already stored on this
+        // entry instead of re-statting -- this is the fast path that turns
+        // TC's per-field burst of queries into a single syscall per row.
+        bool stale;
+        if (now - it->lastStatTick < kStatDebounceMs) {
+            stale = false;
+        } else {
+            FILETIME writeTime{};
+            ULARGE_INTEGER size{};
+            bool haveStamp = GetFileStamp(filePath, writeTime, size);
+            // A path match is only a real hit if the file hasn't changed on
+            // disk since it was cached (e.g. re-saved by another tool between
+            // two field queries for the same row); otherwise fall through and
+            // re-parse.
+            stale = !haveStamp ||
+                    CompareFileTime(&it->lastWriteTime, &writeTime) != 0 ||
+                    it->fileSize.QuadPart != size.QuadPart;
+            it->lastStatTick = now;
+            if (haveStamp) {
+                it->lastWriteTime = writeTime;
+                it->fileSize = size;
+            }
+        }
+
         if (!stale) {
             if (it != g_Cache.begin()) {
                 CacheEntry hit = std::move(*it);
@@ -133,10 +123,21 @@ static void EnsureCached(const std::wstring& filePath) {
         break;
     }
 
-    RawImageMetadata rawMeta;
+    FILETIME writeTime{};
+    ULARGE_INTEGER size{};
+    GetFileStamp(filePath, writeTime, size);
+    ULONGLONG statTick = GetTickCount64();
+
     AImgInfo info;
-    if (MetadataParser::ExtractMetadata(filePath, rawMeta)) {
-        info = AImgDecoder::Decode(rawMeta);
+    try {
+        RawImageMetadata rawMeta;
+        if (MetadataParser::ExtractMetadata(filePath, rawMeta)) {
+            info = AImgDecoder::Decode(rawMeta);
+        }
+    } catch (...) {
+        // Never let an exception escape across the WDX __stdcall boundary into
+        // Total Commander's process; fall through and cache an empty result.
+        info = AImgInfo();
     }
 
     CacheEntry entry;
@@ -144,35 +145,11 @@ static void EnsureCached(const std::wstring& filePath) {
     entry.info = std::move(info);
     entry.lastWriteTime = writeTime;
     entry.fileSize = size;
+    entry.lastStatTick = statTick;
     g_Cache.push_front(std::move(entry));
     if (g_Cache.size() > kCacheCapacity) g_Cache.pop_back();
 }
 
-
-// ---------------------------------------------------------------------------
-// Total Commander WDX Plugin API Exports
-// ---------------------------------------------------------------------------
-
-int __stdcall ContentGetSupportedFieldW(int FieldIndex, WCHAR* FieldName, WCHAR* Units, int maxlen) {
-    if (FieldIndex < 0 || FieldIndex >= g_FieldCount) return ft_nosuchfield;
-
-    wcsncpy_s(FieldName, maxlen, g_Fields[FieldIndex].name, _TRUNCATE);
-    wcsncpy_s(Units, maxlen, g_Fields[FieldIndex].units, _TRUNCATE);
-
-    return g_Fields[FieldIndex].type;
-}
-
-int __stdcall ContentGetSupportedField(int FieldIndex, char* FieldName, char* Units, int maxlen) {
-    if (FieldIndex < 0 || FieldIndex >= g_FieldCount) return ft_nosuchfield;
-
-    WideCharToMultiByte(CP_ACP, 0, g_Fields[FieldIndex].name, -1, FieldName, maxlen, NULL, NULL);
-    WideCharToMultiByte(CP_ACP, 0, g_Fields[FieldIndex].units, -1, Units, maxlen, NULL, NULL);
-
-    int type = g_Fields[FieldIndex].type;
-    if (type == ft_stringw) return ft_string;
-    if (type == ft_fulltextw) return ft_fulltext;
-    return type;
-}
 
 // Writes one chunk of a ft_fulltextw field, honoring TC's continuation
 // protocol: repeated ContentGetValueW calls for the same field must each
@@ -220,6 +197,155 @@ static int WriteStringField(const std::wstring& value, void* FieldValue, int max
     return ft_stringw;
 }
 
+// Shared body for every fixed-size numeric field (ft_numeric_32/64/ft_float):
+// absent -> ft_fieldempty, otherwise a raw write of the typed value into
+// FieldValue (numeric fields have no truncation/maxlen concern, unlike
+// strings). Factored out to remove the copy-pasted has/write/return triple
+// previously repeated per numeric field.
+template <typename T>
+static int WriteNumericField(bool has, T value, int ftType, void* FieldValue) {
+    if (!has) return ft_fieldempty;
+    *(T*)FieldValue = value;
+    return ftType;
+}
+
+// ---------------------------------------------------------------------------
+// Field definitions
+// ---------------------------------------------------------------------------
+//
+// One row per field: name/type/units (what ContentGetSupportedFieldW reports)
+// AND the value-extraction logic (what ContentGetValueW returns) live
+// together here, indexed exactly the way Total Commander addresses a field --
+// by FieldIndex into this single array. Previously these were two
+// hand-synced pieces (this table for metadata, a separate switch(FieldIndex)
+// in ContentGetValueW for values); a new field appended to one without a
+// matching entry in the other silently fell through to ft_nosuchfield/
+// ft_fieldempty instead of a build error. Extractors are captureless lambdas
+// (decay to plain function pointers, no std::function overhead) so adding a
+// field is one self-contained row instead of two edits in two places.
+using FieldExtractor = int (*)(const AImgInfo&, CacheEntry&, int fieldIndex, void* FieldValue, int maxlen);
+
+struct FieldDef {
+    const wchar_t* name;
+    int type;
+    const wchar_t* units;
+    FieldExtractor extract;
+};
+
+static const FieldDef g_Fields[] = {
+    { L"Generator", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.generator, fv, maxlen);
+    } }, // 0
+    { L"Prompt", ft_fulltextw, L"", [](const AImgInfo& info, CacheEntry& ce, int fi, void* fv, int maxlen) {
+        if (info.prompt.empty()) return ft_fieldempty;
+        return WriteFulltextChunk(ce, fi, info.prompt, fv, maxlen);
+    } }, // 1
+    { L"Prompt (Short)", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.prompt, fv, maxlen);
+    } }, // 2
+    { L"Negative Prompt", ft_fulltextw, L"", [](const AImgInfo& info, CacheEntry& ce, int fi, void* fv, int maxlen) {
+        if (info.negative_prompt.empty()) return ft_fieldempty;
+        return WriteFulltextChunk(ce, fi, info.negative_prompt, fv, maxlen);
+    } }, // 3
+    { L"Negative Prompt (Short)", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.negative_prompt, fv, maxlen);
+    } }, // 4
+    { L"Model", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.model, fv, maxlen);
+    } }, // 5
+    { L"Model Hash", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.model_hash, fv, maxlen);
+    } }, // 6
+    { L"Seed", ft_numeric_64, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        return WriteNumericField<__int64>(info.has_seed, info.seed, ft_numeric_64, fv);
+    } }, // 7
+    { L"CFG Scale", ft_float, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        return WriteNumericField<double>(info.has_cfg, info.cfg_scale, ft_float, fv);
+    } }, // 8
+    { L"Steps", ft_numeric_32, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        return WriteNumericField<int>(info.has_steps, info.steps, ft_numeric_32, fv);
+    } }, // 9
+    { L"Sampler", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.sampler, fv, maxlen);
+    } }, // 10
+    { L"Scheduler", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.scheduler, fv, maxlen);
+    } }, // 11
+    { L"Clip Skip", ft_numeric_32, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        return WriteNumericField<int>(info.has_clip_skip, info.clip_skip, ft_numeric_32, fv);
+    } }, // 12
+    { L"Size", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.size, fv, maxlen);
+    } }, // 13
+    { L"Aspect Ratio", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(ComputeAspectRatio(info.size), fv, maxlen);
+    } }, // 14
+    { L"Megapixels", ft_float, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        double mp = 0.0;
+        if (!ComputeMegapixels(info.size, mp)) return ft_fieldempty;
+        *(double*)fv = mp;
+        return ft_float;
+    } }, // 15
+    { L"Denoising Strength", ft_float, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        return WriteNumericField<double>(info.has_denoising_strength, info.denoising_strength, ft_float, fv);
+    } }, // 16
+    { L"Hires Upscale", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.hires_upscale, fv, maxlen);
+    } }, // 17
+    { L"Hires Upscaler", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.hires_upscaler, fv, maxlen);
+    } }, // 18
+    { L"Hires Steps", ft_numeric_32, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        return WriteNumericField<int>(info.has_hires_steps, info.hires_steps, ft_numeric_32, fv);
+    } }, // 19
+    { L"VAE", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.vae, fv, maxlen);
+    } }, // 20
+    { L"LoRA", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
+        return WriteStringField(info.lora, fv, maxlen);
+    } }, // 21
+    { L"LoRA Count", ft_numeric_32, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        int count = CountLoraEntries(info.lora);
+        return WriteNumericField<int>(count != 0, count, ft_numeric_32, fv);
+    } }, // 22
+    { L"Full Parameters", ft_fulltextw, L"", [](const AImgInfo& info, CacheEntry& ce, int fi, void* fv, int maxlen) {
+        if (info.full_parameters.empty()) return ft_fieldempty;
+        return WriteFulltextChunk(ce, fi, info.full_parameters, fv, maxlen);
+    } }, // 23
+    // Extractor is only reachable via ContentGetValueW's own FieldIndex == 24
+    // special case below (it must run BEFORE the has_metadata guard, since
+    // this field's whole point is to report has_metadata itself, including
+    // the false case) -- present here anyway so this row is still the
+    // complete, self-contained definition of the field.
+    { L"Has AI Metadata", ft_boolean, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int) {
+        *(int*)fv = info.has_metadata ? 1 : 0;
+        return ft_boolean;
+    } }, // 24
+};
+
+static const int g_FieldCount = sizeof(g_Fields) / sizeof(g_Fields[0]);
+
+int __stdcall ContentGetSupportedFieldW(int FieldIndex, WCHAR* FieldName, WCHAR* Units, int maxlen) {
+    if (FieldIndex < 0 || FieldIndex >= g_FieldCount) return ft_nosuchfield;
+
+    wcsncpy_s(FieldName, maxlen, g_Fields[FieldIndex].name, _TRUNCATE);
+    wcsncpy_s(Units, maxlen, g_Fields[FieldIndex].units, _TRUNCATE);
+
+    return g_Fields[FieldIndex].type;
+}
+
+int __stdcall ContentGetSupportedField(int FieldIndex, char* FieldName, char* Units, int maxlen) {
+    if (FieldIndex < 0 || FieldIndex >= g_FieldCount) return ft_nosuchfield;
+
+    WideCharToMultiByte(CP_ACP, 0, g_Fields[FieldIndex].name, -1, FieldName, maxlen, NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, g_Fields[FieldIndex].units, -1, Units, maxlen, NULL, NULL);
+
+    int type = g_Fields[FieldIndex].type;
+    if (type == ft_stringw) return ft_string;
+    if (type == ft_fulltextw) return ft_fulltext;
+    return type;
+}
+
 int __stdcall ContentGetValueW(WCHAR* FileName, int FieldIndex, int UnitIndex, void* FieldValue, int maxlen, int flags) {
     UNREFERENCED_PARAMETER(UnitIndex); // all fields are single-unit
     UNREFERENCED_PARAMETER(flags);     // no flag-dependent formatting (e.g. ft_datetime) needed
@@ -234,110 +360,11 @@ int __stdcall ContentGetValueW(WCHAR* FileName, int FieldIndex, int UnitIndex, v
     // Handled before the has_metadata guard below: this field's whole point
     // is to report has_metadata itself, including the false case.
     if (FieldIndex == 24) {
-        *(int*)FieldValue = info.has_metadata ? 1 : 0;
-        return ft_boolean;
+        return g_Fields[FieldIndex].extract(info, cacheEntry, FieldIndex, FieldValue, maxlen);
     }
     if (!info.has_metadata) return ft_fieldempty;
 
-    switch (FieldIndex) {
-        case 0: // Generator
-            return WriteStringField(info.generator, FieldValue, maxlen);
-
-        case 1: // Prompt (full text)
-            if (info.prompt.empty()) return ft_fieldempty;
-            return WriteFulltextChunk(cacheEntry, FieldIndex, info.prompt, FieldValue, maxlen);
-
-        case 2: // Prompt (Short)
-            return WriteStringField(info.prompt, FieldValue, maxlen);
-
-        case 3: // Negative Prompt (full text)
-            if (info.negative_prompt.empty()) return ft_fieldempty;
-            return WriteFulltextChunk(cacheEntry, FieldIndex, info.negative_prompt, FieldValue, maxlen);
-
-        case 4: // Negative Prompt (Short)
-            return WriteStringField(info.negative_prompt, FieldValue, maxlen);
-
-        case 5: // Model
-            return WriteStringField(info.model, FieldValue, maxlen);
-
-        case 6: // Model Hash
-            return WriteStringField(info.model_hash, FieldValue, maxlen);
-
-        case 7: // Seed
-            if (!info.has_seed) return ft_fieldempty;
-            *(__int64*)FieldValue = info.seed;
-            return ft_numeric_64;
-
-        case 8: // CFG Scale
-            if (!info.has_cfg) return ft_fieldempty;
-            *(double*)FieldValue = info.cfg_scale;
-            return ft_float;
-
-        case 9: // Steps
-            if (!info.has_steps) return ft_fieldempty;
-            *(int*)FieldValue = info.steps;
-            return ft_numeric_32;
-
-        case 10: // Sampler
-            return WriteStringField(info.sampler, FieldValue, maxlen);
-
-        case 11: // Scheduler
-            return WriteStringField(info.scheduler, FieldValue, maxlen);
-
-        case 12: // Clip Skip
-            if (!info.has_clip_skip) return ft_fieldempty;
-            *(int*)FieldValue = info.clip_skip;
-            return ft_numeric_32;
-
-        case 13: // Size
-            return WriteStringField(info.size, FieldValue, maxlen);
-
-        case 14: // Aspect Ratio
-            return WriteStringField(ComputeAspectRatio(info.size), FieldValue, maxlen);
-
-        case 15: { // Megapixels
-            double mp = 0.0;
-            if (!ComputeMegapixels(info.size, mp)) return ft_fieldempty;
-            *(double*)FieldValue = mp;
-            return ft_float;
-        }
-
-        case 16: // Denoising Strength
-            if (!info.has_denoising_strength) return ft_fieldempty;
-            *(double*)FieldValue = info.denoising_strength;
-            return ft_float;
-
-        case 17: // Hires Upscale
-            return WriteStringField(info.hires_upscale, FieldValue, maxlen);
-
-        case 18: // Hires Upscaler
-            return WriteStringField(info.hires_upscaler, FieldValue, maxlen);
-
-        case 19: // Hires Steps
-            if (!info.has_hires_steps) return ft_fieldempty;
-            *(int*)FieldValue = info.hires_steps;
-            return ft_numeric_32;
-
-        case 20: // VAE
-            return WriteStringField(info.vae, FieldValue, maxlen);
-
-        case 21: // LoRA
-            return WriteStringField(info.lora, FieldValue, maxlen);
-
-        case 22: { // LoRA Count
-            int count = CountLoraEntries(info.lora);
-            if (count == 0) return ft_fieldempty;
-            *(int*)FieldValue = count;
-            return ft_numeric_32;
-        }
-
-        case 23: // Full Parameters
-            if (info.full_parameters.empty()) return ft_fieldempty;
-            return WriteFulltextChunk(cacheEntry, FieldIndex, info.full_parameters, FieldValue, maxlen);
-
-        default:
-            return ft_nosuchfield;
-    }
+    return g_Fields[FieldIndex].extract(info, cacheEntry, FieldIndex, FieldValue, maxlen);
 }
 
 int __stdcall ContentGetValue(char* FileName, int FieldIndex, int UnitIndex, void* FieldValue, int maxlen, int flags) {

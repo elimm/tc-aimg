@@ -1,6 +1,5 @@
 #include "metadata_parser.h"
 #include <fstream>
-#include <iostream>
 #include <cstring>
 #include <algorithm>
 #include <windows.h>
@@ -338,17 +337,20 @@ bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetad
         return ExtractPNG(file, (uint64_t)fileSize, outMetadata);
     }
 
-    // Every other supported format's parser works off an in-memory buffer;
-    // none of them are as skewed toward one huge skippable payload as PNG's
-    // IDAT, so the existing bounded full read is left as-is here.
+    if (sigLen >= 2 && sig[0] == 0xFF && sig[1] == 0xD8) {
+        file.seekg(2, std::ios::beg);
+        return ExtractJPEG(file, (uint64_t)fileSize, outMetadata);
+    }
+
+    // WebP/AVIF/TIFF parsers work off an in-memory buffer: WebP's spec allows
+    // EXIF/XMP chunks to appear after the (large) image-data chunk, and TIFF
+    // IFD offsets are absolute file offsets that can point anywhere, so
+    // neither can assume metadata sits early like JPEG/PNG do.
     size_t readSize = (size_t)std::min<std::streamsize>(fileSize, 16 * 1024 * 1024);
     std::vector<uint8_t> buffer(readSize);
     file.seekg(0, std::ios::beg);
     file.read((char*)buffer.data(), (std::streamsize)readSize);
 
-    if (sigLen >= 2 && sig[0] == 0xFF && sig[1] == 0xD8) {
-        return ExtractJPEG(buffer, outMetadata);
-    }
     if (sigLen >= 12 && memcmp(sig, "RIFF", 4) == 0 && memcmp(sig + 8, "WEBP", 4) == 0) {
         return ExtractWebP(buffer, outMetadata);
     }
@@ -366,6 +368,20 @@ bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetad
 // ---------------------------------------------------------------------------
 // PNG Extractor
 // ---------------------------------------------------------------------------
+
+// Shared by zTXt (always zlib-compressed) and iTXt (optionally compressed):
+// either zlib-inflate `data` or store it as-is, keyed by `key`.
+static void StorePngText(RawImageMetadata& outMetadata, const std::string& key,
+                          const uint8_t* data, size_t len, bool compressed) {
+    if (compressed) {
+        std::vector<uint8_t> decompressed;
+        if (TinyDeflate::InflateZlib(data, len, decompressed)) {
+            outMetadata.text_chunks[key] = std::string((const char*)decompressed.data(), decompressed.size());
+        }
+    } else {
+        outMetadata.text_chunks[key] = std::string((const char*)data, len);
+    }
+}
 
 bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata) {
     uint64_t pos = 8; // caller has already positioned `file` here, right after the signature
@@ -419,10 +435,7 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
                     size_t compLen = length - (nullPos - data + 2);
 
                     if (compMethod == 0 && compLen > 0) {
-                        std::vector<uint8_t> decompressed;
-                        if (TinyDeflate::InflateZlib(compData, compLen, decompressed)) {
-                            outMetadata.text_chunks[key] = std::string((const char*)decompressed.data(), decompressed.size());
-                        }
+                        StorePngText(outMetadata, key, compData, compLen, /*compressed=*/true);
                     }
                 }
             } else if (chunkType == "iTXt") {
@@ -442,14 +455,7 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
 
                     if (ptr <= end) {
                         size_t textLen = end - ptr;
-                        if (compFlag == 1 && compMethod == 0) {
-                            std::vector<uint8_t> decompressed;
-                            if (TinyDeflate::InflateZlib(ptr, textLen, decompressed)) {
-                                outMetadata.text_chunks[key] = std::string((const char*)decompressed.data(), decompressed.size());
-                            }
-                        } else {
-                            outMetadata.text_chunks[key] = std::string((const char*)ptr, textLen);
-                        }
+                        StorePngText(outMetadata, key, ptr, textLen, /*compressed=*/(compFlag == 1 && compMethod == 0));
                     }
                 }
             } else if (chunkType == "eXIf") {
@@ -477,29 +483,38 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
 // JPEG Extractor
 // ---------------------------------------------------------------------------
 
-bool MetadataParser::ExtractJPEG(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata) {
-    size_t pos = 2;
-    size_t total = buffer.size();
+bool MetadataParser::ExtractJPEG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata) {
+    uint64_t pos = 2; // caller has already positioned `file` here, right after the SOI marker
 
-    while (pos + 4 <= total) {
-        if (buffer[pos] != 0xFF) break;
-        uint8_t marker = buffer[pos + 1];
-        if (marker == 0xDA || marker == 0xD9) break;
+    while (pos + 4 <= fileSize) {
+        file.seekg((std::streamoff)pos, std::ios::beg);
+        uint8_t header[4];
+        file.read((char*)header, 4);
+        if ((uint64_t)file.gcount() != 4) break;
 
-        uint32_t length = ReadU16BE(buffer.data() + pos + 2);
+        if (header[0] != 0xFF) break;
+        uint8_t marker = header[1];
+        if (marker == 0xDA || marker == 0xD9) break; // start-of-scan / end-of-image: entropy-coded pixel data follows, never read it
+
+        uint32_t length = ReadU16BE(header + 2);
         if (length < 2) break;
-        if ((uint64_t)pos + 2 + length > (uint64_t)total) break;
-
-        const uint8_t* payload = buffer.data() + pos + 4;
+        if (pos + 2 + length > fileSize) break;
         size_t payloadLen = length - 2;
 
-        if (marker == 0xE1) {
-            ParseEXIF(payload, payloadLen, outMetadata);
-            if (payloadLen >= 29 && memcmp(payload, "http://ns.adobe.com/xap/1.0/\0", 29) == 0) {
-                ParseXMP(std::string((const char*)payload + 29, payloadLen - 29), outMetadata);
+        if (marker == 0xE1 || marker == 0xFE) {
+            std::vector<uint8_t> payload(payloadLen);
+            if (payloadLen > 0) {
+                file.read((char*)payload.data(), (std::streamsize)payloadLen);
+                if ((uint64_t)file.gcount() != payloadLen) break;
             }
-        } else if (marker == 0xFE) {
-            outMetadata.text_chunks["Comment"] = std::string((const char*)payload, payloadLen);
+            if (marker == 0xE1) {
+                ParseEXIF(payload.data(), payloadLen, outMetadata);
+                if (payloadLen >= 29 && memcmp(payload.data(), "http://ns.adobe.com/xap/1.0/\0", 29) == 0) {
+                    ParseXMP(std::string((const char*)payload.data() + 29, payloadLen - 29), outMetadata);
+                }
+            } else {
+                outMetadata.text_chunks["Comment"] = std::string((const char*)payload.data(), payloadLen);
+            }
         }
 
         pos += 2 + length;
@@ -664,9 +679,9 @@ bool MetadataParser::ParseEXIF(const uint8_t* data, size_t size, RawImageMetadat
                     if (memcmp(valPtr, "UNICODE\0", 8) == 0) {
                         bool actualIsLE = DetectUtf16IsLE(valPtr + 8, cnt - 8, isLE);
                         outMetadata.text_chunks["exif:UserComment"] = actualIsLE ? Utf16LEToUtf8(valPtr + 8, cnt - 8) : Utf16BEToUtf8(valPtr + 8, cnt - 8);
-                    } else if (memcmp(valPtr, "ASCII\0\0\0", 8) == 0) {
-                        outMetadata.text_chunks["exif:UserComment"] = std::string((const char*)valPtr + 8, cnt - 8);
                     } else {
+                        // "ASCII\0\0\0" designator or anything else (undesignated/unrecognized):
+                        // treat as raw 8-bit text either way.
                         outMetadata.text_chunks["exif:UserComment"] = std::string((const char*)valPtr + 8, cnt - 8);
                     }
                 } else {

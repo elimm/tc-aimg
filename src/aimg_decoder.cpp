@@ -1,5 +1,4 @@
 #include "aimg_decoder.h"
-#include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <cctype>
@@ -7,7 +6,6 @@
 #include <cwchar>
 #include <windows.h>
 #include <map>
-#include <unordered_map>
 #include <vector>
 #include <memory>
 
@@ -35,6 +33,12 @@ struct JsonValue {
     double numVal = 0.0;
     std::string strVal;
     std::vector<std::shared_ptr<JsonValue>> arrVal;
+    // std::map, not unordered_map: measured with tests/run_benchmark.bat --
+    // ComfyUI workflow JSON creates hundreds of small per-node objects (a
+    // handful of keys each), and unordered_map's extra per-instance bucket-
+    // array allocation loses to std::map's single tree-node allocation at
+    // this N, both in speed (~2x slower on a 150-node graph) and in binary
+    // size (more template instantiation for hashing/rehashing machinery).
     std::map<std::string, std::shared_ptr<JsonValue>> objVal;
 
     std::string getStr(const std::string& key = "") const {
@@ -398,6 +402,10 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
     };
     std::vector<Candidate> candidates;
     bool hasComfyUIChunk = false;
+    // See the seed-priority override below: "prompt" (API/execution format,
+    // sent at queue time) is authoritative and never overridden; only its
+    // absence makes a disagreeing "workflow"-derived seed suspect.
+    bool hasPromptChunk = rawMeta.text_chunks.count("prompt") > 0;
 
     for (const auto& kv : rawMeta.text_chunks) {
         std::string cleaned = Trim(kv.second);
@@ -455,6 +463,21 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
             for (const auto& cand2 : candidates) {
                 AImgInfo fallback;
                 if (!DecodeAutomatic1111(cand2.text, fallback, /*populateFullParameters=*/false)) continue;
+                // "workflow" is a live snapshot of the frontend's node graph
+                // state at save time, not a frozen execution record: a
+                // KSampler with control_after_generate randomize/increment
+                // advances the displayed (and thus saved) seed the instant
+                // the queued run finishes, so by the time the file is
+                // written, workflow's seed can already be the NEXT run's
+                // seed rather than the one that produced this image. Without
+                // a "prompt" chunk (queue-time, authoritative) to trust
+                // instead, prefer the companion text block's seed over a
+                // disagreeing workflow-derived one rather than just filling
+                // gaps.
+                if (!hasPromptChunk && fallback.has_seed) {
+                    info.seed = fallback.seed;
+                    info.has_seed = true;
+                }
                 MergeGaps(info, fallback);
                 break;
             }
@@ -485,37 +508,22 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
         }
     }
 
-    // 4. Try Easy Diffusion. Must run before InvokeAI: Easy Diffusion's own
-    // JSON schema also has a "negative_prompt" key, which would otherwise
-    // satisfy InvokeAI's (looser) gate below and mislabel the generator.
-    for (auto& cand : candidates) {
-        SimpleJson::JsonValue* json = getJson(cand);
-        if (json && DecodeEasyDiffusion(json, cand.text, info)) {
-            return info;
-        }
-    }
-
-    // 5. Try InvokeAI
-    for (auto& cand : candidates) {
-        SimpleJson::JsonValue* json = getJson(cand);
-        if (json && DecodeInvokeAI(json, cand.text, info)) {
-            return info;
-        }
-    }
-
-    // 6. Try SwarmUI
-    for (auto& cand : candidates) {
-        SimpleJson::JsonValue* json = getJson(cand);
-        if (json && DecodeSwarmUI(json, cand.text, info)) {
-            return info;
-        }
-    }
-
-    // 7. Try NovelAI
-    for (auto& cand : candidates) {
-        SimpleJson::JsonValue* json = getJson(cand);
-        if (json && DecodeNovelAI(json, cand.text, info)) {
-            return info;
+    // 4-7. Try Easy Diffusion, then InvokeAI, then SwarmUI, then NovelAI --
+    // same signature, so one generator-major/candidate-minor loop replaces
+    // four near-identical ones. Order matters and must stay exactly this:
+    // Easy Diffusion before InvokeAI, since Easy Diffusion's own JSON schema
+    // also has a "negative_prompt" key that would otherwise satisfy
+    // InvokeAI's (looser) gate and mislabel the generator.
+    using JsonGeneratorDecodeFn = bool (*)(const SimpleJson::JsonValue*, const std::string&, AImgInfo&);
+    static const JsonGeneratorDecodeFn kJsonGeneratorDecoders[] = {
+        DecodeEasyDiffusion, DecodeInvokeAI, DecodeSwarmUI, DecodeNovelAI
+    };
+    for (auto decodeFn : kJsonGeneratorDecoders) {
+        for (auto& cand : candidates) {
+            SimpleJson::JsonValue* json = getJson(cand);
+            if (json && decodeFn(json, cand.text, info)) {
+                return info;
+            }
         }
     }
 
@@ -849,8 +857,13 @@ std::string NamedWidgetString(const JsonValue* node, const std::string& widgetNa
 // its nodes/links -- so resolving a link never crosses into a different
 // subgraph's namesake id by accident.
 struct UiLinkIndex {
-    std::unordered_map<std::string, const JsonValue*> nodesById;
-    std::unordered_map<std::string, std::string> linkOrigin;
+    // std::map, not unordered_map: same rationale as JsonValue::objVal above --
+    // small per-graph N, and consolidating on one associative-container
+    // backend avoids carrying both the tree-map and hash-map template
+    // machinery (rehashing, bucket lists, hash<string>) in the binary for no
+    // measured benefit at this scale.
+    std::map<std::string, const JsonValue*> nodesById;
+    std::map<std::string, std::string> linkOrigin;
     // A link whose origin is the subgraph's own boundary-input sentinel node
     // (id matches that subgraph's "inputNode") maps here instead of
     // linkOrigin -- value is the link's "origin_slot", which indexes both
@@ -861,11 +874,20 @@ struct UiLinkIndex {
     // to whatever stale/demo value was frozen on the inner node at the
     // moment its widget got converted into a socket, not the value actually
     // used to generate the image.
-    std::unordered_map<std::string, int> boundarySlot;
+    std::map<std::string, int> boundarySlot;
 };
 
+// Built via reserve+append rather than operator+ chaining (scopeId + '\x1f'
+// + id) to do one allocation instead of two -- called once per node/link
+// during CollectUiNodesAndLinks/ResolveLinkNode/TryResolveBoundary for every
+// UI-format ComfyUI graph decoded.
 std::string ScopedKey(const std::string& scopeId, const std::string& id) {
-    return scopeId + '\x1f' + id;
+    std::string key;
+    key.reserve(scopeId.size() + 1 + id.size());
+    key.append(scopeId);
+    key.push_back('\x1f');
+    key.append(id);
+    return key;
 }
 
 // One subgraph definition plus (heuristically) the node that instantiates
@@ -883,7 +905,7 @@ struct SubgraphInfo {
     const JsonValue* def = nullptr;
     const JsonValue* instanceNode = nullptr;
 };
-using SubgraphRegistry = std::unordered_map<std::string, SubgraphInfo>;
+using SubgraphRegistry = std::map<std::string, SubgraphInfo>;
 
 // Follows a UI-format link id to the node that originates it. Returns
 // nullptr if the link or its origin node is unknown, so callers can just
@@ -933,12 +955,17 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
     if (const auto* inputNode = scope->getObj("inputNode")) {
         if (inputNode->objVal.count("id")) boundaryInputId = JsonIdToString(inputNode->objVal.at("id").get());
     }
+    // Boundary (promoted-widget) links are collected here and resolved to a
+    // widgets_values index in a second pass below, once every link in the
+    // scope is known -- see the comment on UiLinkIndex::boundarySlot.
+    struct BoundaryLink { std::string linkKey; int originSlot; std::string targetId; int targetSlot; };
+    std::vector<BoundaryLink> boundaryLinks;
     if (scope->objVal.count("links") && scope->objVal.at("links")->type == JsonType::Array) {
         for (const auto& l : scope->objVal.at("links")->arrVal) {
             if (!l) continue;
             int64_t linkId = 0;
-            std::string originId;
-            int originSlot = -1;
+            std::string originId, targetId;
+            int originSlot = -1, targetSlot = -1;
             if (l->type == JsonType::Array) {
                 // Classic ComfyUI link tuple: [link_id, origin_node_id,
                 // origin_slot, target_node_id, target_slot, type].
@@ -946,6 +973,8 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
                 linkId = (int64_t)l->arrVal[0]->numVal;
                 originId = JsonIdToString(l->arrVal[1].get());
                 if (l->arrVal.size() > 2 && l->arrVal[2] && l->arrVal[2]->type == JsonType::Number) originSlot = (int)l->arrVal[2]->numVal;
+                if (l->arrVal.size() > 3 && l->arrVal[3]) targetId = JsonIdToString(l->arrVal[3].get());
+                if (l->arrVal.size() > 4 && l->arrVal[4] && l->arrVal[4]->type == JsonType::Number) targetSlot = (int)l->arrVal[4]->numVal;
             } else if (l->type == JsonType::Object) {
                 // Newer subgraph-capable ComfyUI versions instead store each
                 // link as an object: {"id": 40, "origin_id": 28,
@@ -962,16 +991,64 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
                 if (l->objVal.count("origin_slot") && l->objVal.at("origin_slot") && l->objVal.at("origin_slot")->type == JsonType::Number) {
                     originSlot = (int)l->objVal.at("origin_slot")->numVal;
                 }
+                if (l->objVal.count("target_id") && l->objVal.at("target_id")) targetId = JsonIdToString(l->objVal.at("target_id").get());
+                if (l->objVal.count("target_slot") && l->objVal.at("target_slot") && l->objVal.at("target_slot")->type == JsonType::Number) {
+                    targetSlot = (int)l->objVal.at("target_slot")->numVal;
+                }
             } else {
                 continue;
             }
             if (originId.empty()) continue;
             std::string linkKey = ScopedKey(scopeId, std::to_string(linkId));
             if (!boundaryInputId.empty() && originId == boundaryInputId && originSlot >= 0) {
-                index.boundarySlot[linkKey] = originSlot;
+                boundaryLinks.push_back({linkKey, originSlot, targetId, targetSlot});
             } else {
                 index.linkOrigin[linkKey] = ScopedKey(scopeId, originId);
             }
+        }
+    }
+    if (!boundaryLinks.empty()) {
+        // A subgraph's boundary "inputs[]" is a flat list mixing pure-link
+        // sockets (IMAGE/MODEL/CLIP/VAE/CONDITIONING/...) with promoted
+        // widgets (STRING/INT/FLOAT/BOOLEAN/COMBO/...) -- only the latter get
+        // an entry in the instantiating node's widgets_values[], so
+        // origin_slot cannot be used as a widgets_values index directly. For
+        // example, if subgraph input 0 is a socket-only IMAGE and input 1 is
+        // a promoted "prompt", the real prompt value sits at
+        // widgets_values[0], not widgets_values[1] -- indexing by raw
+        // origin_slot silently grabs the wrong (often numeric/boolean) slot,
+        // fails whatever type check the caller applies, and falls back to
+        // the inner node's own stale/demo local value instead. Determine
+        // widget-backed-ness per distinct origin_slot by checking whether
+        // that slot's link target actually has a "widget" key on its own
+        // node (mirrors NamedWidgetString's same-node widget-index
+        // counting), then assign sequential widgets_values indices in
+        // origin_slot order, skipping socket-only slots entirely.
+        std::map<int, bool> slotIsWidget;
+        for (const auto& bl : boundaryLinks) {
+            if (slotIsWidget.count(bl.originSlot)) continue;
+            bool isWidget = false;
+            if (!bl.targetId.empty() && bl.targetSlot >= 0) {
+                auto nodeIt = index.nodesById.find(ScopedKey(scopeId, bl.targetId));
+                if (nodeIt != index.nodesById.end() && nodeIt->second->objVal.count("inputs") &&
+                    nodeIt->second->objVal.at("inputs")->type == JsonType::Array) {
+                    const auto& inputs = nodeIt->second->objVal.at("inputs")->arrVal;
+                    if (bl.targetSlot < (int)inputs.size() && inputs[bl.targetSlot] &&
+                        inputs[bl.targetSlot]->type == JsonType::Object) {
+                        isWidget = inputs[bl.targetSlot]->objVal.count("widget") != 0;
+                    }
+                }
+            }
+            slotIsWidget[bl.originSlot] = isWidget;
+        }
+        std::map<int, int> slotToWidgetIndex;
+        int nextIndex = 0;
+        for (const auto& kv : slotIsWidget) {
+            if (kv.second) slotToWidgetIndex[kv.first] = nextIndex++;
+        }
+        for (const auto& bl : boundaryLinks) {
+            auto it = slotToWidgetIndex.find(bl.originSlot);
+            if (it != slotToWidgetIndex.end()) index.boundarySlot[bl.linkKey] = it->second;
         }
     }
 }
@@ -1149,8 +1226,8 @@ struct WidgetFieldMap {
     int seedIdx, stepsIdx, cfgIdx, denoiseIdx, samplerIdx, schedulerIdx;
 };
 
-const std::unordered_map<std::string, WidgetFieldMap>& GetWidgetFieldMaps() {
-    static const std::unordered_map<std::string, WidgetFieldMap> kMaps = {
+const std::map<std::string, WidgetFieldMap>& GetWidgetFieldMaps() {
+    static const std::map<std::string, WidgetFieldMap> kMaps = {
         // Standard ComfyUI-core KSampler widget order:
         // [seed, control_after_generate, steps, cfg, sampler_name, scheduler, denoise].
         {"KSampler",         {7, /*seed*/0, /*steps*/2, /*cfg*/3, /*denoise*/6, /*sampler*/4, /*scheduler*/5}},
@@ -1724,25 +1801,62 @@ bool AImgDecoder::DecodeEasyDiffusion(const SimpleJson::JsonValue* root, const s
 
 
 // ---------------------------------------------------------------------------
-// InvokeAI Decoder
+// InvokeAI / SwarmUI / NovelAI Decoders
 // ---------------------------------------------------------------------------
+//
+// These three share one shape: gate on a generator-distinctive key (so an
+// unrelated JSON object -- including another of these three's own metadata
+// -- doesn't falsely match), then pull prompt/negative-prompt/model/cfg/
+// sampler out of flat top-level keys whose *names* differ per generator.
+// Parameterized into one helper; each Decode* below just supplies the key
+// names. Easy Diffusion is NOT folded in here despite a similar shape: it
+// has extra fields (vae/lora/denoising-strength/size) with no equivalent
+// in this shape, so forcing it in would add more config surface than it
+// would remove duplication.
+namespace {
+struct SimpleGeneratorConfig {
+    const char* gateKey1;             // required key OR gateKey2 present to claim this JSON
+    const char* gateKey2;              // "" if only one gate key
+    const wchar_t* generatorName;
+    const char* promptKey;
+    const char* promptFallbackKey;     // used when promptKey's value is empty; "" if unused
+    const char* negPromptKey;
+    const char* modelKey;              // "" if this generator has no model field
+    const char* cfgKey;                // passed through to ExtractSeedCfgSteps
+    const char* samplerKey;            // "" if this generator has no sampler field
+};
+}
+
+bool AImgDecoder::DecodeSimpleGraphGenerator(const SimpleJson::JsonValue* root, const std::string& originalText,
+                                              AImgInfo& info, const void* cfgVoid) {
+    const auto& cfg = *static_cast<const SimpleGeneratorConfig*>(cfgVoid);
+    if (!root || root->type != SimpleJson::JsonType::Object) return false;
+    bool gated = root->objVal.count(cfg.gateKey1) ||
+                 (cfg.gateKey2[0] != '\0' && root->objVal.count(cfg.gateKey2));
+    if (!gated) return false;
+
+    info.has_metadata = true;
+    info.generator = cfg.generatorName;
+    std::string prompt = root->getStr(cfg.promptKey);
+    if (prompt.empty() && cfg.promptFallbackKey[0] != '\0') prompt = root->getStr(cfg.promptFallbackKey);
+    info.prompt = Utf8ToWstring(prompt);
+    info.negative_prompt = Utf8ToWstring(root->getStr(cfg.negPromptKey));
+    if (cfg.modelKey[0] != '\0') info.model = Utf8ToWstring(root->getStr(cfg.modelKey));
+    ExtractSeedCfgSteps(root, cfg.cfgKey, info);
+    if (cfg.samplerKey[0] != '\0') info.sampler = Utf8ToWstring(root->getStr(cfg.samplerKey));
+    info.full_parameters = Utf8ToWstring(originalText);
+    return true;
+}
 
 bool AImgDecoder::DecodeInvokeAI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
-    if (!root || root->type != SimpleJson::JsonType::Object) return false;
     // "positive_prompt"/"negative_prompt" naming is distinctly InvokeAI;
     // without this gate any JSON object (including SwarmUI/NovelAI's own
     // metadata) would match here, since this decoder runs before them.
-    if (!root->objVal.count("positive_prompt") && !root->objVal.count("negative_prompt")) return false;
-
-    info.has_metadata = true;
-    info.generator = L"InvokeAI";
-    info.prompt = Utf8ToWstring(root->getStr("positive_prompt").empty() ? root->getStr("prompt") : root->getStr("positive_prompt"));
-    info.negative_prompt = Utf8ToWstring(root->getStr("negative_prompt"));
-    info.model = Utf8ToWstring(root->getStr("model"));
-    ExtractSeedCfgSteps(root, "cfg_scale", info);
-    info.sampler = Utf8ToWstring(root->getStr("scheduler"));
-    info.full_parameters = Utf8ToWstring(originalText);
-    return true;
+    static const SimpleGeneratorConfig cfg = {
+        "positive_prompt", "negative_prompt", L"InvokeAI",
+        "positive_prompt", "prompt", "negative_prompt", "model", "cfg_scale", "scheduler"
+    };
+    return DecodeSimpleGraphGenerator(root, originalText, info, &cfg);
 }
 
 
@@ -1751,20 +1865,14 @@ bool AImgDecoder::DecodeInvokeAI(const SimpleJson::JsonValue* root, const std::s
 // ---------------------------------------------------------------------------
 
 bool AImgDecoder::DecodeSwarmUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
-    if (!root || root->type != SimpleJson::JsonType::Object) return false;
     // "cfgscale"/"negativeprompt" (no separator) is SwarmUI's distinctive
     // naming, as opposed to A1111's "CFG scale" or InvokeAI/NovelAI's
     // "cfg_scale"/"scale" -- without this gate any JSON object would match.
-    if (!root->objVal.count("cfgscale") && !root->objVal.count("negativeprompt")) return false;
-
-    info.has_metadata = true;
-    info.generator = L"SwarmUI";
-    info.prompt = Utf8ToWstring(root->getStr("prompt"));
-    info.negative_prompt = Utf8ToWstring(root->getStr("negativeprompt"));
-    info.model = Utf8ToWstring(root->getStr("model"));
-    ExtractSeedCfgSteps(root, "cfgscale", info);
-    info.full_parameters = Utf8ToWstring(originalText);
-    return true;
+    static const SimpleGeneratorConfig cfg = {
+        "cfgscale", "negativeprompt", L"SwarmUI",
+        "prompt", "", "negativeprompt", "model", "cfgscale", ""
+    };
+    return DecodeSimpleGraphGenerator(root, originalText, info, &cfg);
 }
 
 
@@ -1790,20 +1898,13 @@ bool AImgDecoder::DecodeFooocus(const std::string& paramText, AImgInfo& info) {
 // ---------------------------------------------------------------------------
 
 bool AImgDecoder::DecodeNovelAI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
-    if (!root || root->type != SimpleJson::JsonType::Object) return false;
     // "uc" (undesired content = negative prompt) is distinctly NovelAI naming
     // -- without this gate any JSON object would match here.
-    if (!root->objVal.count("uc")) return false;
-
-    info.has_metadata = true;
-    info.generator = L"NovelAI";
-    info.prompt = Utf8ToWstring(root->getStr("prompt"));
-    info.negative_prompt = Utf8ToWstring(root->getStr("uc"));
-    ExtractSeedCfgSteps(root, "scale", info);
-    info.sampler = Utf8ToWstring(root->getStr("sampler"));
-
+    static const SimpleGeneratorConfig cfg = {
+        "uc", "", L"NovelAI",
+        "prompt", "", "uc", "", "scale", "sampler"
+    };
+    if (!DecodeSimpleGraphGenerator(root, originalText, info, &cfg)) return false;
     info.size = MakeSizeString(root->getInt64("width"), root->getInt64("height"));
-
-    info.full_parameters = Utf8ToWstring(originalText);
     return true;
 }

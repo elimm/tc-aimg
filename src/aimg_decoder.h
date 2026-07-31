@@ -27,6 +27,12 @@ private:
     static bool DecodeSwarmUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
     static bool DecodeFooocus(const std::string& paramText, AImgInfo& info);
     static bool DecodeNovelAI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
+    // Shared implementation for InvokeAI/SwarmUI/NovelAI (see definition site
+    // in aimg_decoder.cpp for why Easy Diffusion isn't folded in too). cfgVoid
+    // is a `const SimpleGeneratorConfig*` -- that type is file-local to
+    // aimg_decoder.cpp, hence the void* here rather than exposing it in this header.
+    static bool DecodeSimpleGraphGenerator(const SimpleJson::JsonValue* root, const std::string& originalText,
+                                            AImgInfo& info, const void* cfgVoid);
 
     static std::wstring Utf8ToWstring(const std::string& str);
     static std::string Trim(const std::string& str);

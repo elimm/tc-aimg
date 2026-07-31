@@ -29,7 +29,7 @@ if(MSVC)
     # /OPT:REF,ICF (drop/fold unused code), /GR- (no RTTI: unused in this
     # codebase, no dynamic_cast/typeid) -- safe, behavior-preserving size/perf
     # flags with no new runtime dependency.
-    target_compile_options(aimg PRIVATE /W4 /WX /O2 /GL /Gy /GR- /DUNICODE /D_UNICODE)
+    target_compile_options(aimg PRIVATE /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE)
     target_link_options(aimg PRIVATE /LTCG /OPT:REF /OPT:ICF)
 else()
     # Static runtime linkage, matching build.bat's raw g++ invocation: this
@@ -37,7 +37,8 @@ else()
     # alongside its own runtime, so it must not depend on libgcc/libstdc++/
     # libwinpthread being present on the target machine.
     # -flto/-fno-rtti/-ffunction-sections+-fdata-sections+--gc-sections are the
-    # GCC/Clang equivalents of the MSVC flags above.
+    # GCC/Clang equivalents of the MSVC flags above; -s strips symbols (smaller
+    # DLL, matching /GL+/OPT:REF,ICF's size-reduction goal on the MSVC side).
     target_compile_options(aimg PRIVATE -Wall -O3 -flto -fno-rtti -ffunction-sections -fdata-sections -DUNICODE -D_UNICODE)
-    target_link_options(aimg PRIVATE -static -flto -Wl,--gc-sections)
+    target_link_options(aimg PRIVATE -static -flto -s -Wl,--gc-sections)
 endif()

@@ -14,6 +14,16 @@ struct RawImageMetadata {
     // e.g. "exif:UserComment" -> "..."
     // e.g. "exif:ImageDescription" -> "..."
     // e.g. "Comment" -> "..."
+    //
+    // Deliberately std::map, not unordered_map: AImgDecoder::DecodeCore
+    // iterates text_chunks to build its candidate list, and when both
+    // "prompt" and "workflow" chunks are present for a ComfyUI file, the
+    // FIRST candidate in iteration order is tried first. std::map's
+    // alphabetical order happens to put "prompt" (the authoritative
+    // API/execution-format graph) before "workflow" (a live UI snapshot that
+    // can disagree on seed on control_after_generate seeds). An
+    // unordered_map would make that ordering hash-dependent and could
+    // silently flip which chunk wins.
     std::map<std::string, std::string> text_chunks;
 };
 
@@ -28,7 +38,11 @@ private:
     // render) are skipped with seekg() instead of being read into memory.
     // `file` must be positioned right after the 8-byte PNG signature.
     static bool ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata);
-    static bool ExtractJPEG(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata);
+    // Streamed like ExtractPNG: JPEG marker segments are walked directly off
+    // the file stream and the loop always stops at the SOS/EOI marker, so the
+    // (potentially multi-MB) entropy-coded scan data after it is never read.
+    // `file` must be positioned right after the 2-byte SOI marker.
+    static bool ExtractJPEG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata);
     static bool ExtractWebP(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata);
     static bool ExtractISOBMFF_AVIF(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata);
     static bool ExtractTIFF(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata);
