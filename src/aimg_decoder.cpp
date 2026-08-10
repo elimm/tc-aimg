@@ -1,6 +1,7 @@
 #include "aimg_decoder.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cctype>
 #include <cwctype>
 #include <cwchar>
@@ -70,6 +71,16 @@ struct JsonValue {
         }
         return nullptr;
     }
+
+    // Single map lookup, used at call sites that previously did a
+    // count()-then-at() pair (two independent O(log n) tree descents on
+    // std::map for the same key) -- getObj() above is kept as-is since it's
+    // already part of the public parsing API and used the same way elsewhere.
+    const JsonValue* find(const std::string& key) const {
+        if (type != JsonType::Object) return nullptr;
+        auto it = objVal.find(key);
+        return it != objVal.end() ? it->second.get() : nullptr;
+    }
 };
 
 class JsonParser {
@@ -88,9 +99,22 @@ class JsonParser {
         pos++;
         std::string res;
         while (pos < src.size()) {
-            char c = src[pos++];
+            // Bulk-append the unescaped run up to the next quote/backslash
+            // instead of appending one byte at a time -- most JSON string
+            // content in these files (node type names, class_type strings,
+            // prompt text) has no escapes at all, so this turns the common
+            // case into a single memcpy-like append instead of N small ones.
+            size_t special = src.find_first_of("\"\\", pos);
+            if (special == std::string::npos) {
+                res.append(src, pos, src.size() - pos);
+                pos = src.size();
+                break;
+            }
+            if (special > pos) res.append(src, pos, special - pos);
+            char c = src[special];
+            pos = special + 1;
             if (c == '"') return res;
-            if (c == '\\' && pos < src.size()) {
+            if (pos < src.size()) {
                 char esc = src[pos++];
                 if (esc == '"') res += '"';
                 else if (esc == '\\') res += '\\';
@@ -133,7 +157,7 @@ class JsonParser {
                     }
                 } else res += esc;
             } else {
-                res += c;
+                res += c; // trailing lone backslash at end of input
             }
         }
         return res;
@@ -163,7 +187,7 @@ public:
                 skipWS();
                 if (pos < src.size() && src[pos] == ':') pos++;
                 auto child = parse();
-                if (child) val->objVal[key] = child;
+                if (child) val->objVal.emplace(std::move(key), std::move(child));
                 skipWS();
                 if (pos < src.size() && src[pos] == ',') { pos++; continue; }
                 if (pos < src.size() && src[pos] == '}') { pos++; break; }
@@ -179,7 +203,7 @@ public:
             if (pos < src.size() && src[pos] == ']') { pos++; depth--; return val; }
             while (pos < src.size()) {
                 auto child = parse();
-                if (child) val->arrVal.push_back(child);
+                if (child) val->arrVal.push_back(std::move(child));
                 skipWS();
                 if (pos < src.size() && src[pos] == ',') { pos++; continue; }
                 if (pos < src.size() && src[pos] == ']') { pos++; break; }
@@ -214,7 +238,7 @@ public:
             while (pos < src.size() && (isdigit((unsigned char)src[pos]) || src[pos] == '.' || src[pos] == 'e' || src[pos] == 'E' || src[pos] == '+' || src[pos] == '-')) {
                 pos++;
             }
-            val->numVal = strtod(src.substr(start, pos - start).c_str(), NULL);
+            val->numVal = strtod(src.c_str() + start, NULL);
             return val;
         } else if (src.compare(pos, 4, "true") == 0) {
             val->type = JsonType::Bool; val->boolVal = true; pos += 4; return val;
@@ -249,6 +273,7 @@ std::string AImgDecoder::Trim(const std::string& str) {
     size_t first = str.find_first_not_of(kWhitespace, 0, sizeof(kWhitespace));
     if (first == std::string::npos) return "";
     size_t last = str.find_last_not_of(kWhitespace, std::string::npos, sizeof(kWhitespace));
+    if (first == 0 && last == str.size() - 1) return str; // already trimmed: skip the copy
     return str.substr(first, (last - first + 1));
 }
 
@@ -277,16 +302,16 @@ static bool LooksLikeGenerationText(const std::string& s) {
 // Only sets has_seed/has_cfg/has_steps when the key is actually present, so a
 // genuinely missing field isn't indistinguishable from a real value of 0.
 void AImgDecoder::ExtractSeedCfgSteps(const SimpleJson::JsonValue* jsonObj, const std::string& cfgKey, AImgInfo& info) {
-    if (jsonObj->objVal.count("seed")) {
-        info.seed = jsonObj->getInt64("seed");
+    if (auto* v = jsonObj->find("seed")) {
+        info.seed = v->getInt64();
         info.has_seed = true;
     }
-    if (jsonObj->objVal.count(cfgKey)) {
-        info.cfg_scale = jsonObj->getNum(cfgKey);
+    if (auto* v = jsonObj->find(cfgKey)) {
+        info.cfg_scale = v->getNum();
         info.has_cfg = true;
     }
-    if (jsonObj->objVal.count("steps")) {
-        info.steps = (int32_t)jsonObj->getInt64("steps");
+    if (auto* v = jsonObj->find("steps")) {
+        info.steps = (int32_t)v->getInt64();
         info.has_steps = true;
     }
 }
@@ -485,17 +510,41 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
         }
     }
 
+    // 1b. Try Draw Things next, for the same reason as Fooocus below: it
+    // embeds BOTH a well-formed JSON payload (in an XMP "exif:UserComment"
+    // tag) AND a duplicate, human-readable "Steps: N, Sampler: X, ..." text
+    // block (in the companion "dc:description" tag) that satisfies the loose
+    // A1111 substring check further down -- but under different key names
+    // ("Guidance Scale" not "CFG scale", "LoRA N Model/Weight" not "Lora
+    // hashes"), so that match would silently miss CFG/LoRA/denoising-strength
+    // that only the JSON carries. Must run before the A1111 loop.
+    for (auto& cand : candidates) {
+        SimpleJson::JsonValue* json = getJson(cand);
+        if (json && DecodeDrawThings(json, cand.text, info)) {
+            return info;
+        }
+    }
+
     // 2. Try Fooocus first: it emits an A1111-style parameter block, so the
     // generic A1111 check below would always match it before this branch
     // gets a chance to run.
     for (const auto& cand : candidates) {
+        if (cand.key == "xmp") continue; // see the "xmp" note on the A1111 loop below
         if (DecodeFooocus(cand.text, info)) {
             return info;
         }
     }
 
-    // 3. Try Automatic1111 / SD.Next / Forge on candidates
+    // 3. Try Automatic1111 / SD.Next / Forge on candidates. Skip the "xmp"
+    // key specifically: ParseXMP always stores the FULL, untouched XML/RDF
+    // wrapper text there (in addition to extracting named sub-fields into
+    // "xmp:*" keys) -- real generation params never look like that, but the
+    // loose "Steps:"/"Negative prompt:"/"Sampler:" substring check below can
+    // still find those words buried in a free-text description deep inside
+    // the markup (e.g. Draw Things' dc:description tag), matching from
+    // offset 0 and taking the literal "<x:xmpmeta ...>" header as the prompt.
     for (const auto& cand : candidates) {
+        if (cand.key == "xmp") continue;
         if (DecodeAutomatic1111(cand.text, info)) {
             // If the file ALSO carries a distinct ComfyUI chunk/structural marker,
             // relabel the generator as ComfyUI. Deliberately does not match on
@@ -596,6 +645,13 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
     info.negative_prompt = Utf8ToWstring(Trim(negPrompt));
 
     std::string civitaiResources;
+    // Forge-neo builds (Version: neo...) drop the classic "VAE:" key and
+    // instead log auxiliary components -- VAE, text encoders, etc. -- as an
+    // unordered numbered list ("Module 1:", "Module 2:", ...) with no fixed
+    // VAE index. Remember the first one seen; only used as a fallback below
+    // if no real "VAE:" key showed up, so it never overwrites Forge-classic
+    // output that has both.
+    std::wstring moduleVaeCandidate;
     if (!paramsLine.empty()) {
         // Values like "Lora hashes" are themselves a quoted, comma-separated
         // sub-list (e.g. Lora hashes: "name1: hash1, name2: hash2") -- a
@@ -661,10 +717,26 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
                     info.lora = Utf8ToWstring(v);
                 } else if (k == "Civitai resources") {
                     civitaiResources = v;
+                } else if (moduleVaeCandidate.empty() && k.rfind("Module ", 0) == 0) {
+                    moduleVaeCandidate = Utf8ToWstring(v);
+                } else if (k == "Version") {
+                    // WebUI Forge rebrands its own "Version:" value distinctly
+                    // from stock A1111/SD.Next -- classic Forge uses "f<ver>v<...>"
+                    // (e.g. "f2.0.1v1.10.1-previous-639-ga2302538"), Forge-neo
+                    // uses "neo"/"neo-<ver>" outright. Stock A1111 just uses its
+                    // own "v<ver>" (e.g. "v1.7.0"), so a leading "f" followed by
+                    // a digit, or a leading "neo", is unambiguous.
+                    if ((v.size() > 1 && v[0] == 'f' && isdigit((unsigned char)v[1])) ||
+                        v.rfind("neo", 0) == 0) {
+                        info.generator = L"Forge";
+                    }
                 }
             }
             start = nextComma + 2;
         }
+    }
+    if (info.vae.empty() && !moduleVaeCandidate.empty()) {
+        info.vae = moduleVaeCandidate;
     }
 
     // CivitAI's own generation UI omits the classic "Model:"/"Model hash:"
@@ -720,6 +792,44 @@ std::string JsonIdToString(const JsonValue* idv) {
     return "";
 }
 
+// Defined below, near DecodeDrawThings; forward-declared here since
+// DecodeComfyUI's rgthree Power-Lora-Loader handling needs it too.
+std::string FormatCompactNumber(double v);
+
+// Case-insensitive substring check, for class_type matching where custom
+// node packs vary a stock name's capitalization (e.g. "UnetLoaderGGUF" vs.
+// the stock "UNETLoader") in addition to prefixing/suffixing it.
+bool ContainsCI(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    // A ComfyUI graph's node-type loop calls this several times per node
+    // (once per candidate loader name) across potentially hundreds of
+    // nodes -- std::search with a per-character comparator avoids the two
+    // heap-allocating lowercased copies a naive lower(haystack).find(lower(
+    // needle)) would make on every call (measured ~10% slower on the
+    // 150-node ComfyUI benchmark case in tests/run_benchmark.bat).
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+        [](char a, char b) { return tolower((unsigned char)a) == tolower((unsigned char)b); });
+    return it != haystack.end();
+}
+
+// Parses A1111-style "<lora:name:weight>" tags (LoraTagLoader's own input
+// convention, borrowed straight from A1111 prompt syntax) out of arbitrary
+// text and appends each as "name: weight" to out, matching the display shape
+// every other generator's LoRA field already uses.
+void ExtractLoraTags(const std::string& text, std::vector<std::string>& out) {
+    size_t pos = 0;
+    while ((pos = text.find("<lora:", pos)) != std::string::npos) {
+        size_t end = text.find('>', pos);
+        if (end == std::string::npos) break;
+        std::string tag = text.substr(pos + 6, end - (pos + 6));
+        size_t colon = tag.find(':');
+        std::string name = colon == std::string::npos ? tag : tag.substr(0, colon);
+        std::string weight = colon == std::string::npos ? "1" : tag.substr(colon + 1);
+        if (!name.empty()) out.push_back(name + ": " + weight);
+        pos = end + 1;
+    }
+}
+
 // Extracts the referenced node id from a ComfyUI graph link, which is
 // encoded as a 2-element array [node_id, output_slot].
 std::string GetLinkNodeId(const JsonValue* v) {
@@ -736,7 +846,9 @@ std::string GetLinkNodeId(const JsonValue* v) {
 // through a separate primitive node instead of embedding the value directly,
 // so a plain getStr("text")/getNum("width") on the referencing node alone
 // would see only the link array and come back empty/zero.
-std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, int depth = 0) {
+double ResolveNumberField(const JsonValue* nodesObj, const JsonValue* field, bool& found, const char* preferredKey = nullptr, int depth = 0);
+
+std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, const char* preferredKey = nullptr, int depth = 0) {
     if (!field || depth > 4) return "";
     if (field->type == JsonType::String) return field->strVal;
     if (field->type == JsonType::Number) {
@@ -754,15 +866,124 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
     if (it == nodesObj->objVal.end() || !it->second) return "";
     const auto* refInputs = it->second->getObj("inputs");
     if (!refInputs) return "";
-    if (refInputs->objVal.count("text")) {
-        std::string r = ResolveTextField(nodesObj, refInputs->objVal.at("text").get(), depth + 1);
+
+    // Prompt-enhancement/LLM-expansion workflows commonly route a
+    // CLIPTextEncode's "text" through ComfyUI's stock control-flow/utility
+    // nodes before reaching the literal -- a ComfySwitchNode picking between
+    // two upstream sources (e.g. "use the LLM-expanded prompt if available,
+    // else the raw one"), StringConcatenate joining two strings, or a
+    // Reroute/PreviewAny passthrough. These use the exact same input-socket
+    // names in both the API (flat, handled here) and UI graph formats, since
+    // both serialize the same node's Python INPUT_TYPES -- mirrors
+    // ResolveUiTextThroughLink's handling of the identical node types for
+    // the UI-format graph.
+    std::string classType = it->second->getStr("class_type");
+    if (classType == "ComfySwitchNode") {
+        bool switchFound = false;
+        double switchVal = 0.0;
+        if (const JsonValue* sw = refInputs->find("switch")) {
+            if (sw->type == JsonType::Bool) { switchVal = sw->boolVal ? 1.0 : 0.0; switchFound = true; }
+            else { switchVal = ResolveNumberField(nodesObj, sw, switchFound); }
+        }
+        // Prefer whichever branch the switch condition actually selects --
+        // but if that branch resolves empty (e.g. it flows through an
+        // LLM/vision node like TextGenerate whose output is computed at
+        // runtime and never stored in the saved graph, so it can't be
+        // recovered at all), a plausible prompt from the other branch is a
+        // far better result than surfacing nothing. Same fallback order as
+        // ResolveUiTextThroughLink: selected branch, then on_true, then
+        // on_false, regardless of whether that repeats the first attempt.
+        if (switchFound) {
+            const char* primary = switchVal != 0.0 ? "on_true" : "on_false";
+            if (const JsonValue* v = refInputs->find(primary)) {
+                std::string r = ResolveTextField(nodesObj, v, preferredKey, depth + 1);
+                if (!r.empty()) return r;
+            }
+        }
+        if (const JsonValue* v = refInputs->find("on_true")) {
+            std::string r = ResolveTextField(nodesObj, v, preferredKey, depth + 1);
+            if (!r.empty()) return r;
+        }
+        if (const JsonValue* v = refInputs->find("on_false")) {
+            return ResolveTextField(nodesObj, v, preferredKey, depth + 1);
+        }
+        return "";
+    }
+    if (classType == "StringConcatenate") {
+        const JsonValue* aField = refInputs->find("string_a");
+        const JsonValue* bField = refInputs->find("string_b");
+        std::string a = aField ? ResolveTextField(nodesObj, aField, preferredKey, depth + 1) : "";
+        std::string b = bField ? ResolveTextField(nodesObj, bField, preferredKey, depth + 1) : "";
+        if (a.empty()) return b;
+        if (b.empty()) return a;
+        std::string sep = refInputs->getStr("delimiter");
+        return a + sep + b;
+    }
+    if (classType == "Reroute" || classType == "PreviewAny") {
+        if (const JsonValue* v = refInputs->find("source")) {
+            return ResolveTextField(nodesObj, v, preferredKey, depth + 1);
+        }
+        return "";
+    }
+
+    // A "Selector"-style helper node commonly reuses the outer field's own
+    // name (e.g. a "Sampler Selector" node's "sampler_name") for its literal,
+    // rather than a generic "text"/"value" key -- check that first.
+    if (preferredKey) {
+        if (const JsonValue* v = refInputs->find(preferredKey)) {
+            std::string r = ResolveTextField(nodesObj, v, preferredKey, depth + 1);
+            if (!r.empty()) return r;
+        }
+    }
+    if (const JsonValue* v = refInputs->find("text")) {
+        std::string r = ResolveTextField(nodesObj, v, preferredKey, depth + 1);
         if (!r.empty()) return r;
     }
-    if (refInputs->objVal.count("value")) {
-        std::string r = ResolveTextField(nodesObj, refInputs->objVal.at("value").get(), depth + 1);
+    if (const JsonValue* v = refInputs->find("value")) {
+        std::string r = ResolveTextField(nodesObj, v, preferredKey, depth + 1);
         if (!r.empty()) return r;
     }
     return "";
+}
+
+// Numeric counterpart to ResolveTextField: follows a field that may be a
+// literal number or a link ([node_id, output_slot]) to a "literal number"
+// helper node's actual value. Unlike text nodes (which consistently expose
+// their literal under "text"/"value"), numeric literal-source custom nodes
+// use a variety of field names (a "Seed Generator" node's "seed", Crystools'
+// "Primitive integer"'s "int", stock PrimitiveInt/PrimitiveFloat's "value")
+// -- prefer the conventional "value" key, then fall back to the first
+// Number-typed input found on the node.
+double ResolveNumberField(const JsonValue* nodesObj, const JsonValue* field, bool& found, const char* preferredKey, int depth) {
+    found = false;
+    if (!field || depth > 4) return 0.0;
+    if (field->type == JsonType::Number) { found = true; return field->numVal; }
+    if (field->type != JsonType::Array) return 0.0;
+    std::string nodeId = GetLinkNodeId(field);
+    if (nodeId.empty()) return 0.0;
+    auto it = nodesObj->objVal.find(nodeId);
+    if (it == nodesObj->objVal.end() || !it->second) return 0.0;
+    const auto* refInputs = it->second->getObj("inputs");
+    if (!refInputs) return 0.0;
+    // A named helper node (e.g. "Seed Generator") commonly reuses the outer
+    // field's own key ("seed") for its literal -- prefer that over a
+    // same-node sibling field (e.g. "increment") that also happens to be
+    // numeric, which the generic fallback below would otherwise grab first
+    // purely due to std::map's alphabetical key order.
+    if (preferredKey) {
+        if (const JsonValue* v = refInputs->find(preferredKey)) {
+            double r = ResolveNumberField(nodesObj, v, found, preferredKey, depth + 1);
+            if (found) return r;
+        }
+    }
+    if (const JsonValue* v = refInputs->find("value")) {
+        double r = ResolveNumberField(nodesObj, v, found, preferredKey, depth + 1);
+        if (found) return r;
+    }
+    for (const auto& kv : refInputs->objVal) {
+        if (kv.second && kv.second->type == JsonType::Number) { found = true; return kv.second->numVal; }
+    }
+    return 0.0;
 }
 
 // Resolves an API-format node id to its positive/negative prompt text -- the
@@ -780,12 +1001,12 @@ std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId
     if (it == nodesObj->objVal.end() || !it->second) return "";
     const auto* refInputs = it->second->getObj("inputs");
     if (!refInputs) return "";
-    if (refInputs->objVal.count("text")) {
-        return ResolveTextField(nodesObj, refInputs->objVal.at("text").get());
+    if (const JsonValue* v = refInputs->find("text")) {
+        return ResolveTextField(nodesObj, v);
     }
     const char* fallbackKey = isPositive ? "prompt" : "negative_prompt";
-    if (refInputs->objVal.count(fallbackKey)) {
-        return ResolveTextField(nodesObj, refInputs->objVal.at(fallbackKey).get());
+    if (const JsonValue* v = refInputs->find(fallbackKey)) {
+        return ResolveTextField(nodesObj, v);
     }
     return "";
 }
@@ -800,8 +1021,9 @@ std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId
 // the SAME node (e.g. TextEncodeMageFlowEdit): resolving both outputs would
 // otherwise return the identical first string for both roles.
 std::string FirstWidgetString(const JsonValue* node, int skip = 0) {
-    if (!node || !node->objVal.count("widgets_values") || node->objVal.at("widgets_values")->type != JsonType::Array) return "";
-    for (const auto& v : node->objVal.at("widgets_values")->arrVal) {
+    const JsonValue* wv = node ? node->find("widgets_values") : nullptr;
+    if (!wv || wv->type != JsonType::Array) return "";
+    for (const auto& v : wv->arrVal) {
         if (v && v->type == JsonType::String && !v->strVal.empty()) {
             if (skip > 0) { skip--; continue; }
             return v->strVal;
@@ -819,12 +1041,14 @@ std::string FirstWidgetString(const JsonValue* node, int skip = 0) {
 // "inputs", so the Nth such entry maps onto widgets_values[N].
 std::string NamedWidgetString(const JsonValue* node, const std::string& widgetName) {
     if (!node || node->type != JsonType::Object) return "";
-    if (!node->objVal.count("inputs") || node->objVal.at("inputs")->type != JsonType::Array) return "";
-    if (!node->objVal.count("widgets_values") || node->objVal.at("widgets_values")->type != JsonType::Array) return "";
-    const auto& wArr = node->objVal.at("widgets_values")->arrVal;
+    const JsonValue* inputsField = node->find("inputs");
+    const JsonValue* wvField = node->find("widgets_values");
+    if (!inputsField || inputsField->type != JsonType::Array) return "";
+    if (!wvField || wvField->type != JsonType::Array) return "";
+    const auto& wArr = wvField->arrVal;
     size_t widgetIndex = 0;
-    for (const auto& inp : node->objVal.at("inputs")->arrVal) {
-        if (!inp || inp->type != JsonType::Object || !inp->objVal.count("widget")) continue;
+    for (const auto& inp : inputsField->arrVal) {
+        if (!inp || inp->type != JsonType::Object || !inp->find("widget")) continue;
         if (inp->getStr("name") == widgetName) {
             if (widgetIndex < wArr.size() && wArr[widgetIndex] && wArr[widgetIndex]->type == JsonType::String) {
                 return wArr[widgetIndex]->strVal;
@@ -931,8 +1155,9 @@ const JsonValue* TryResolveBoundary(const std::string& scopeId, int64_t linkId, 
     auto regIt = registry.find(scopeId);
     if (regIt == registry.end() || !regIt->second.instanceNode) return nullptr;
     const JsonValue* inst = regIt->second.instanceNode;
-    if (!inst->objVal.count("widgets_values") || inst->objVal.at("widgets_values")->type != JsonType::Array) return nullptr;
-    const auto& wArr = inst->objVal.at("widgets_values")->arrVal;
+    const JsonValue* wvField = inst->find("widgets_values");
+    if (!wvField || wvField->type != JsonType::Array) return nullptr;
+    const auto& wArr = wvField->arrVal;
     int slot = slotIt->second;
     if (slot < 0 || slot >= (int)wArr.size() || !wArr[slot]) return nullptr;
     return wArr[slot].get();
@@ -940,11 +1165,15 @@ const JsonValue* TryResolveBoundary(const std::string& scopeId, int64_t linkId, 
 
 void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, UiLinkIndex& index) {
     if (!scope || scope->type != JsonType::Object) return;
-    if (scope->objVal.count("nodes") && scope->objVal.at("nodes")->type == JsonType::Array) {
-        for (const auto& n : scope->objVal.at("nodes")->arrVal) {
-            if (!n || n->type != JsonType::Object || !n->objVal.count("id")) continue;
-            std::string idStr = JsonIdToString(n->objVal.at("id").get());
-            if (!idStr.empty()) index.nodesById[ScopedKey(scopeId, idStr)] = n.get();
+    if (const JsonValue* nodesField = scope->find("nodes")) {
+        if (nodesField->type == JsonType::Array) {
+            for (const auto& n : nodesField->arrVal) {
+                if (!n || n->type != JsonType::Object) continue;
+                const JsonValue* idField = n->find("id");
+                if (!idField) continue;
+                std::string idStr = JsonIdToString(idField);
+                if (!idStr.empty()) index.nodesById[ScopedKey(scopeId, idStr)] = n.get();
+            }
         }
     }
     // A subgraph definition's own boundary-input sentinel node id (e.g.
@@ -953,15 +1182,16 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
     // link. Top-level graphs have no "inputNode".
     std::string boundaryInputId;
     if (const auto* inputNode = scope->getObj("inputNode")) {
-        if (inputNode->objVal.count("id")) boundaryInputId = JsonIdToString(inputNode->objVal.at("id").get());
+        if (const JsonValue* idField = inputNode->find("id")) boundaryInputId = JsonIdToString(idField);
     }
     // Boundary (promoted-widget) links are collected here and resolved to a
     // widgets_values index in a second pass below, once every link in the
     // scope is known -- see the comment on UiLinkIndex::boundarySlot.
     struct BoundaryLink { std::string linkKey; int originSlot; std::string targetId; int targetSlot; };
     std::vector<BoundaryLink> boundaryLinks;
-    if (scope->objVal.count("links") && scope->objVal.at("links")->type == JsonType::Array) {
-        for (const auto& l : scope->objVal.at("links")->arrVal) {
+    const JsonValue* linksField = scope->find("links");
+    if (linksField && linksField->type == JsonType::Array) {
+        for (const auto& l : linksField->arrVal) {
             if (!l) continue;
             int64_t linkId = 0;
             std::string originId, targetId;
@@ -982,18 +1212,17 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
                 // "STRING"}. Without handling this shape, every link in a
                 // subgraph-based workflow is silently dropped and positive/
                 // negative-prompt/text-through-a-link resolution never fires.
-                if (!l->objVal.count("id") || !l->objVal.count("origin_id")) continue;
-                const auto& idv = l->objVal.at("id");
-                const auto& originv = l->objVal.at("origin_id");
+                const JsonValue* idv = l->find("id");
+                const JsonValue* originv = l->find("origin_id");
                 if (!idv || idv->type != JsonType::Number || !originv) continue;
                 linkId = (int64_t)idv->numVal;
-                originId = JsonIdToString(originv.get());
-                if (l->objVal.count("origin_slot") && l->objVal.at("origin_slot") && l->objVal.at("origin_slot")->type == JsonType::Number) {
-                    originSlot = (int)l->objVal.at("origin_slot")->numVal;
+                originId = JsonIdToString(originv);
+                if (const JsonValue* originSlotField = l->find("origin_slot")) {
+                    if (originSlotField->type == JsonType::Number) originSlot = (int)originSlotField->numVal;
                 }
-                if (l->objVal.count("target_id") && l->objVal.at("target_id")) targetId = JsonIdToString(l->objVal.at("target_id").get());
-                if (l->objVal.count("target_slot") && l->objVal.at("target_slot") && l->objVal.at("target_slot")->type == JsonType::Number) {
-                    targetSlot = (int)l->objVal.at("target_slot")->numVal;
+                if (const JsonValue* targetIdField = l->find("target_id")) targetId = JsonIdToString(targetIdField);
+                if (const JsonValue* targetSlotField = l->find("target_slot")) {
+                    if (targetSlotField->type == JsonType::Number) targetSlot = (int)targetSlotField->numVal;
                 }
             } else {
                 continue;
@@ -1030,12 +1259,12 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
             bool isWidget = false;
             if (!bl.targetId.empty() && bl.targetSlot >= 0) {
                 auto nodeIt = index.nodesById.find(ScopedKey(scopeId, bl.targetId));
-                if (nodeIt != index.nodesById.end() && nodeIt->second->objVal.count("inputs") &&
-                    nodeIt->second->objVal.at("inputs")->type == JsonType::Array) {
-                    const auto& inputs = nodeIt->second->objVal.at("inputs")->arrVal;
+                const JsonValue* targetInputs = nodeIt != index.nodesById.end() ? nodeIt->second->find("inputs") : nullptr;
+                if (targetInputs && targetInputs->type == JsonType::Array) {
+                    const auto& inputs = targetInputs->arrVal;
                     if (bl.targetSlot < (int)inputs.size() && inputs[bl.targetSlot] &&
                         inputs[bl.targetSlot]->type == JsonType::Object) {
-                        isWidget = inputs[bl.targetSlot]->objVal.count("widget") != 0;
+                        isWidget = inputs[bl.targetSlot]->find("widget") != nullptr;
                     }
                 }
             }
@@ -1059,12 +1288,14 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
 // was never converted to a socket.
 bool GetNodeInputLink(const JsonValue* node, const std::string& name, int64_t& outLinkId) {
     if (!node || node->type != JsonType::Object) return false;
-    if (!node->objVal.count("inputs") || node->objVal.at("inputs")->type != JsonType::Array) return false;
-    for (const auto& inp : node->objVal.at("inputs")->arrVal) {
+    const JsonValue* inputsField = node->find("inputs");
+    if (!inputsField || inputsField->type != JsonType::Array) return false;
+    for (const auto& inp : inputsField->arrVal) {
         if (!inp || inp->type != JsonType::Object) continue;
         if (inp->getStr("name") != name) continue;
-        if (!inp->objVal.count("link") || !inp->objVal.at("link") || inp->objVal.at("link")->type != JsonType::Number) return false;
-        outLinkId = (int64_t)inp->objVal.at("link")->numVal;
+        const JsonValue* linkField = inp->find("link");
+        if (!linkField || linkField->type != JsonType::Number) return false;
+        outLinkId = (int64_t)linkField->numVal;
         return true;
     }
     return false;
@@ -1082,8 +1313,9 @@ int ResolveUiBoolLink(const std::string& scopeId, int64_t linkId, const UiLinkIn
     if (depth > 6) return -1;
     const JsonValue* node = ResolveLinkNode(scopeId, linkId, index);
     if (!node) return -1;
-    if (!node->objVal.count("widgets_values") || node->objVal.at("widgets_values")->type != JsonType::Array) return -1;
-    const auto& w = node->objVal.at("widgets_values")->arrVal;
+    const JsonValue* wvField = node->find("widgets_values");
+    if (!wvField || wvField->type != JsonType::Array) return -1;
+    const auto& w = wvField->arrVal;
     if (!w.empty() && w[0] && w[0]->type == JsonType::Bool) return w[0]->boolVal ? 1 : 0;
     return -1;
 }
@@ -1112,9 +1344,12 @@ std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId,
         int switchVal = -1;
         int64_t switchLink = 0;
         if (GetNodeInputLink(node, "switch", switchLink)) switchVal = ResolveUiBoolLink(scopeId, switchLink, index, depth + 1);
-        if (switchVal == -1 && node->objVal.count("widgets_values") && node->objVal.at("widgets_values")->type == JsonType::Array) {
-            const auto& w = node->objVal.at("widgets_values")->arrVal;
-            if (!w.empty() && w[0] && w[0]->type == JsonType::Bool) switchVal = w[0]->boolVal ? 1 : 0;
+        if (switchVal == -1) {
+            const JsonValue* wvField = node->find("widgets_values");
+            if (wvField && wvField->type == JsonType::Array) {
+                const auto& w = wvField->arrVal;
+                if (!w.empty() && w[0] && w[0]->type == JsonType::Bool) switchVal = w[0]->boolVal ? 1 : 0;
+            }
         }
         int64_t branchLink = 0;
         // Prefer whichever branch the switch's own condition actually
@@ -1147,9 +1382,11 @@ std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId,
         std::string a = GetNodeInputLink(node, "string_a", aLink) ? ResolveUiTextThroughLink(scopeId, aLink, index, registry, depth + 1) : "";
         std::string b = GetNodeInputLink(node, "string_b", bLink) ? ResolveUiTextThroughLink(scopeId, bLink, index, registry, depth + 1) : "";
         std::string sep;
-        if (node->objVal.count("widgets_values") && node->objVal.at("widgets_values")->type == JsonType::Array) {
-            const auto& w = node->objVal.at("widgets_values")->arrVal;
-            if (w.size() > 2 && w[2] && w[2]->type == JsonType::String) sep = w[2]->strVal;
+        if (const JsonValue* wvField = node->find("widgets_values")) {
+            if (wvField->type == JsonType::Array) {
+                const auto& w = wvField->arrVal;
+                if (w.size() > 2 && w[2] && w[2]->type == JsonType::String) sep = w[2]->strVal;
+            }
         }
         if (a.empty()) return b;
         if (b.empty()) return a;
@@ -1161,12 +1398,14 @@ std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId,
         if (GetNodeInputLink(node, "source", srcLink) || GetNodeInputLink(node, "value", srcLink)) {
             return ResolveUiTextThroughLink(scopeId, srcLink, index, registry, depth + 1);
         }
-        if (node->objVal.count("inputs") && node->objVal.at("inputs")->type == JsonType::Array &&
-            !node->objVal.at("inputs")->arrVal.empty()) {
-            const auto& inp0 = node->objVal.at("inputs")->arrVal[0];
-            if (inp0 && inp0->type == JsonType::Object && inp0->objVal.count("link") &&
-                inp0->objVal.at("link") && inp0->objVal.at("link")->type == JsonType::Number) {
-                return ResolveUiTextThroughLink(scopeId, (int64_t)inp0->objVal.at("link")->numVal, index, registry, depth + 1);
+        const JsonValue* inputsField = node->find("inputs");
+        if (inputsField && inputsField->type == JsonType::Array && !inputsField->arrVal.empty()) {
+            const auto& inp0 = inputsField->arrVal[0];
+            if (inp0 && inp0->type == JsonType::Object) {
+                const JsonValue* linkField = inp0->find("link");
+                if (linkField && linkField->type == JsonType::Number) {
+                    return ResolveUiTextThroughLink(scopeId, (int64_t)linkField->numVal, index, registry, depth + 1);
+                }
             }
         }
         return "";
@@ -1325,6 +1564,10 @@ struct ComfyUiExtraction {
     std::string posPromptText, negPromptText;
     std::string modelName, vaeName, samplerName, schedulerName;
     std::string uiResolvedPos, uiResolvedNeg;
+    // Filled by TraverseUiNodes; used only as a fallback when the API-format
+    // ("prompt" chunk) traversal above found no LoRAs at all, since that
+    // traversal is the authoritative execution graph when present.
+    std::vector<std::string> loras;
 };
 
 // A UI-format node's "mode" is an editor-only run-state flag ComfyUI
@@ -1340,8 +1583,7 @@ struct ComfyUiExtraction {
 // the UI/"workflow" format keeps everything the editor last had open.
 bool IsNodeDisabled(const JsonValue* node) {
     if (!node || node->type != JsonType::Object) return false;
-    if (!node->objVal.count("mode")) return false;
-    const auto& m = node->objVal.at("mode");
+    const JsonValue* m = node->find("mode");
     if (!m || m->type != JsonType::Number) return false;
     int mode = (int)m->numVal;
     return mode == 2 || mode == 4;
@@ -1365,15 +1607,17 @@ void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray, 
         // "positive"/"negative" CONDITIONING source can be resolved the same
         // way regardless of that node's own type (KSampler, KSamplerAdvanced,
         // CFGGuider, ...).
-        if (item->objVal.count("inputs") && item->objVal.at("inputs")->type == JsonType::Array) {
+        const JsonValue* itemInputs = item->find("inputs");
+        if (itemInputs && itemInputs->type == JsonType::Array) {
             int64_t posLinkId = 0, negLinkId = 0;
             bool hasPosLink = false, hasNegLink = false;
-            for (const auto& inp : item->objVal.at("inputs")->arrVal) {
+            for (const auto& inp : itemInputs->arrVal) {
                 if (!inp || inp->type != JsonType::Object) continue;
                 std::string inName = inp->getStr("name");
                 if (inName != "positive" && inName != "negative") continue;
-                if (!inp->objVal.count("link") || !inp->objVal.at("link") || inp->objVal.at("link")->type != JsonType::Number) continue;
-                int64_t linkId = (int64_t)inp->objVal.at("link")->numVal;
+                const JsonValue* linkField = inp->find("link");
+                if (!linkField || linkField->type != JsonType::Number) continue;
+                int64_t linkId = (int64_t)linkField->numVal;
                 if (inName == "positive") { posLinkId = linkId; hasPosLink = true; }
                 else { negLinkId = linkId; hasNegLink = true; }
             }
@@ -1398,8 +1642,9 @@ void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray, 
         // the child's own type -- it does NOT verify the child is itself an
         // Object. "widgets_values" is an Array, so it must be read via
         // objVal + an explicit Array type check, not getObj().
-        if (!item->objVal.count("widgets_values") || item->objVal.at("widgets_values")->type != JsonType::Array) continue;
-        const auto& wArr = item->objVal.at("widgets_values")->arrVal;
+        const JsonValue* itemWv = item->find("widgets_values");
+        if (!itemWv || itemWv->type != JsonType::Array) continue;
+        const auto& wArr = itemWv->arrVal;
 
         if (typeStr == "CLIPTextEncode" || typeStr.find("TextEncode") != std::string::npos) {
             std::string text;
@@ -1442,8 +1687,8 @@ void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray, 
                 else if (out.negPromptText.empty()) out.negPromptText = text;
             }
             if (!negFromNamedField.empty() && out.negPromptText.empty()) out.negPromptText = negFromNamedField;
-        } else if (typeStr == "Load Checkpoint" || typeStr.find("CheckpointLoader") != std::string::npos ||
-                   typeStr.find("UNETLoader") != std::string::npos || typeStr.find("DiffusionModelLoader") != std::string::npos) {
+        } else if (typeStr == "Load Checkpoint" || ContainsCI(typeStr, "CheckpointLoader") ||
+                   ContainsCI(typeStr, "UNETLoader") || ContainsCI(typeStr, "DiffusionModelLoader")) {
             std::string name;
             if (out.modelName.empty()) {
                 if (TryBoundaryString(item.get(), "ckpt_name", scopeId, linkIndex, registry, name) ||
@@ -1461,6 +1706,30 @@ void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray, 
                     out.vaeName = name;
                 } else if (!wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
                     out.vaeName = wArr[0]->strVal;
+                }
+            }
+        } else if (ContainsCI(typeStr, "Lora")) {
+            // Stock/renamed loaders with a single widget-backed "lora_name"
+            // field (e.g. "LoraLoader"/"LoraLoaderModelOnly", or a custom-pack
+            // rename) -- mirrors DecodeComfyUI's API-format "lora_name" branch.
+            std::string name = NamedWidgetString(item.get(), "lora_name");
+            if (name.empty() && !wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
+                name = wArr[0]->strVal;
+            }
+            if (!name.empty()) {
+                out.loras.push_back(name);
+            } else {
+                // rgthree's "Power Lora Loader" multi-slot shape -- the same
+                // {"on": bool, "lora": name, "strength": num} object per
+                // lora_N slot the API-format graph exposes under "inputs",
+                // just serialized inside widgets_values instead.
+                for (const auto& w : wArr) {
+                    if (!w || w->type != JsonType::Object || !w->find("lora")) continue;
+                    const JsonValue* onField = w->find("on");
+                    if (onField && onField->type == JsonType::Bool && !onField->boolVal) continue;
+                    std::string loraName = w->getStr("lora");
+                    if (loraName.empty()) continue;
+                    out.loras.push_back(loraName + ": " + FormatCompactNumber(w->getNum("strength")));
                 }
             }
         } else {
@@ -1481,10 +1750,12 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     if (!root || root->type != SimpleJson::JsonType::Object) return false;
 
     const SimpleJson::JsonValue* nodesObj = root;
-    if (root->objVal.count("prompt") && root->objVal.at("prompt")->type == SimpleJson::JsonType::Object) {
-        nodesObj = root->objVal.at("prompt").get();
-    } else if (root->objVal.count("workflow") && root->objVal.at("workflow")->type == SimpleJson::JsonType::Object) {
-        nodesObj = root->objVal.at("workflow").get();
+    const auto* promptField = root->find("prompt");
+    const auto* workflowField = root->find("workflow");
+    if (promptField && promptField->type == SimpleJson::JsonType::Object) {
+        nodesObj = promptField;
+    } else if (workflowField && workflowField->type == SimpleJson::JsonType::Object) {
+        nodesObj = workflowField;
     }
 
     // Require at least one node that actually looks like a ComfyUI graph node
@@ -1502,12 +1773,14 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             break;
         }
     }
-    if (!looksLikeComfyGraph && nodesObj->objVal.count("nodes") &&
-        nodesObj->objVal.at("nodes")->type == SimpleJson::JsonType::Array) {
-        for (const auto& item : nodesObj->objVal.at("nodes")->arrVal) {
-            if (item && item->type == SimpleJson::JsonType::Object && !item->getStr("type").empty()) {
-                looksLikeComfyGraph = true;
-                break;
+    if (!looksLikeComfyGraph) {
+        const auto* topNodes = nodesObj->find("nodes");
+        if (topNodes && topNodes->type == SimpleJson::JsonType::Array) {
+            for (const auto& item : topNodes->arrVal) {
+                if (item && item->type == SimpleJson::JsonType::Object && !item->getStr("type").empty()) {
+                    looksLikeComfyGraph = true;
+                    break;
+                }
             }
         }
     }
@@ -1540,43 +1813,52 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         if (classType == "KSampler" || classType == "KSamplerAdvanced" || classType == "KSamplerSelect" ||
             classType == "CFGGuider" || classType == "RandomNoise" ||
             classType.find("Sampler") != std::string::npos || classType.find("Scheduler") != std::string::npos) {
-            if (inputs->objVal.count("seed")) {
-                info.seed = inputs->getInt64("seed");
-                info.has_seed = true;
-            } else if (inputs->objVal.count("noise_seed")) {
-                info.seed = inputs->getInt64("noise_seed");
-                info.has_seed = true;
+            // seed/steps/cfg/denoise are usually literal numbers, but some
+            // graphs route them through a separate helper node (e.g. a
+            // "Seed Generator" custom node, or Crystools' "Primitive
+            // integer") via a link array instead -- ResolveNumberField
+            // follows that link. A plain getInt64/getNum on the link array
+            // itself would silently read 0 while still marking the field
+            // "found", permanently locking in the wrong value (MergeGaps'
+            // companion-text gap-fill only fires on genuinely-empty fields).
+            bool foundNum;
+            if (const auto* v = inputs->find("seed")) {
+                double n = ResolveNumberField(nodesObj, v, foundNum, "seed");
+                if (foundNum) { info.seed = (int64_t)n; info.has_seed = true; }
+            } else if (const auto* v2 = inputs->find("noise_seed")) {
+                double n = ResolveNumberField(nodesObj, v2, foundNum, "noise_seed");
+                if (foundNum) { info.seed = (int64_t)n; info.has_seed = true; }
             }
-            if (inputs->objVal.count("steps")) {
-                info.steps = (int32_t)inputs->getInt64("steps");
-                info.has_steps = true;
+            if (const auto* v = inputs->find("steps")) {
+                double n = ResolveNumberField(nodesObj, v, foundNum, "steps");
+                if (foundNum) { info.steps = (int32_t)n; info.has_steps = true; }
             }
-            if (inputs->objVal.count("cfg")) {
-                info.cfg_scale = inputs->getNum("cfg");
-                info.has_cfg = true;
+            if (const auto* v = inputs->find("cfg")) {
+                double n = ResolveNumberField(nodesObj, v, foundNum, "cfg");
+                if (foundNum) { info.cfg_scale = n; info.has_cfg = true; }
             }
-            if (inputs->objVal.count("sampler_name")) {
-                ui.samplerName = inputs->getStr("sampler_name");
+            if (const auto* v = inputs->find("sampler_name")) {
+                ui.samplerName = ResolveTextField(nodesObj, v, "sampler_name");
             }
-            if (inputs->objVal.count("scheduler")) {
-                ui.schedulerName = inputs->getStr("scheduler");
+            if (const auto* v = inputs->find("scheduler")) {
+                ui.schedulerName = ResolveTextField(nodesObj, v, "scheduler");
             }
-            if (inputs->objVal.count("denoise")) {
-                info.denoising_strength = inputs->getNum("denoise");
-                info.has_denoising_strength = true;
+            if (const auto* v = inputs->find("denoise")) {
+                double n = ResolveNumberField(nodesObj, v, foundNum, "denoise");
+                if (foundNum) { info.denoising_strength = n; info.has_denoising_strength = true; }
             }
-            if (positiveNodeId.empty() && inputs->objVal.count("positive")) {
-                positiveNodeId = GetLinkNodeId(inputs->objVal.at("positive").get());
+            if (positiveNodeId.empty()) {
+                if (const auto* v = inputs->find("positive")) positiveNodeId = GetLinkNodeId(v);
             }
-            if (negativeNodeId.empty() && inputs->objVal.count("negative")) {
-                negativeNodeId = GetLinkNodeId(inputs->objVal.at("negative").get());
+            if (negativeNodeId.empty()) {
+                if (const auto* v = inputs->find("negative")) negativeNodeId = GetLinkNodeId(v);
             }
         }
 
         if (classType == "CLIPTextEncode" || classType == "BNK_CLIPTextEncodeAdvanced" ||
             classType.find("Prompt") != std::string::npos || classType.find("TextEncode") != std::string::npos) {
-            if (inputs->objVal.count("text")) {
-                std::string text = ResolveTextField(nodesObj, inputs->objVal.at("text").get());
+            if (const auto* textField = inputs->find("text")) {
+                std::string text = ResolveTextField(nodesObj, textField);
                 if (!text.empty()) {
                     if (ui.posPromptText.empty()) ui.posPromptText = text;
                     else if (ui.negPromptText.empty()) ui.negPromptText = text;
@@ -1587,13 +1869,17 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                 // instead of a shared "text" -- read both by name rather than
                 // the encounter-order guess above, which would otherwise only
                 // ever see one of the two fields on such a node.
-                if (ui.posPromptText.empty() && inputs->objVal.count("prompt")) {
-                    std::string t = ResolveTextField(nodesObj, inputs->objVal.at("prompt").get());
-                    if (!t.empty()) ui.posPromptText = t;
+                if (ui.posPromptText.empty()) {
+                    if (const auto* v = inputs->find("prompt")) {
+                        std::string t = ResolveTextField(nodesObj, v);
+                        if (!t.empty()) ui.posPromptText = t;
+                    }
                 }
-                if (ui.negPromptText.empty() && inputs->objVal.count("negative_prompt")) {
-                    std::string t = ResolveTextField(nodesObj, inputs->objVal.at("negative_prompt").get());
-                    if (!t.empty()) ui.negPromptText = t;
+                if (ui.negPromptText.empty()) {
+                    if (const auto* v = inputs->find("negative_prompt")) {
+                        std::string t = ResolveTextField(nodesObj, v);
+                        if (!t.empty()) ui.negPromptText = t;
+                    }
                 }
             }
         }
@@ -1603,29 +1889,68 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         // "ckpt_name"/"unet_name" input but isn't literally one of the
         // stock class_type strings, so match on substring like the
         // "Sampler"/"Scheduler" routing above rather than an exact list.
-        if (classType == "Load Checkpoint" || classType.find("CheckpointLoader") != std::string::npos ||
-            classType.find("DiffusionModelLoader") != std::string::npos || classType.find("UNETLoader") != std::string::npos) {
-            if (inputs->objVal.count("ckpt_name")) ui.modelName = inputs->getStr("ckpt_name");
-            else if (inputs->objVal.count("unet_name")) ui.modelName = inputs->getStr("unet_name");
-            else if (inputs->objVal.count("model_name")) ui.modelName = inputs->getStr("model_name");
+        // Case-insensitive because GGUF-quantized loader variants (e.g.
+        // "UnetLoaderGGUF") don't preserve the stock "UNETLoader" casing.
+        if (classType == "Load Checkpoint" || ContainsCI(classType, "CheckpointLoader") ||
+            ContainsCI(classType, "DiffusionModelLoader") || ContainsCI(classType, "UNETLoader")) {
+            if (inputs->find("ckpt_name")) ui.modelName = inputs->getStr("ckpt_name");
+            else if (inputs->find("unet_name")) ui.modelName = inputs->getStr("unet_name");
+            else if (inputs->find("model_name")) ui.modelName = inputs->getStr("model_name");
         }
 
-        if (classType == "VAELoader" && inputs->objVal.count("vae_name")) {
+        if (classType == "VAELoader" && inputs->find("vae_name")) {
             ui.vaeName = inputs->getStr("vae_name");
         }
 
-        if ((classType == "LoraLoader" || classType == "LoraLoaderModelOnly") && inputs->objVal.count("lora_name")) {
+        bool classTypeHasLora = classType.find("Lora") != std::string::npos;
+
+        // LoraTagLoader has no "lora_name"/slot fields at all -- it reads its
+        // LoRA list out of A1111-style "<lora:name:weight>" tags embedded in
+        // its own "text" input (commonly the same text that also becomes the
+        // prompt, via a link chain resolved the same way as CLIPTextEncode's).
+        if (classType == "LoraTagLoader") {
+            if (const auto* v = inputs->find("text")) {
+                std::string text = ResolveTextField(nodesObj, v);
+                ExtractLoraTags(text, loras);
+            }
+        }
+        // Custom node packs commonly wrap the stock LoRA loader under a
+        // renamed class_type (e.g. "LoraSelector") that keeps the same
+        // "lora_name" input -- substring match like the checkpoint/sampler/
+        // scheduler routing above rather than an exact list.
+        else if (classTypeHasLora && inputs->find("lora_name")) {
             loras.push_back(inputs->getStr("lora_name"));
+        } else if (classTypeHasLora) {
+            // rgthree's "Power Lora Loader" has no single "lora_name" -- it
+            // exposes several numbered slots instead, each an object
+            // {"on": bool, "lora": name, "strength": num}. std::map's
+            // alphabetical iteration already visits "lora_1".."lora_9" in
+            // the right order. Only an explicit "on": false excludes a slot
+            // -- absent/non-bool "on" is treated as enabled, matching every
+            // other optional field's "missing means default" convention
+            // used elsewhere in this decoder.
+            for (const auto& kv : inputs->objVal) {
+                if (kv.first.rfind("lora_", 0) != 0 || !kv.second || kv.second->type != JsonType::Object) continue;
+                const auto& slot = *kv.second;
+                const JsonValue* onField = slot.find("on");
+                if (onField && onField->type == JsonType::Bool && !onField->boolVal) continue;
+                std::string name = slot.getStr("lora");
+                if (name.empty()) continue;
+                loras.push_back(name + ": " + FormatCompactNumber(slot.getNum("strength")));
+            }
         }
 
-        if ((classType == "EmptyLatentImage" || classType == "EmptySD3LatentImage" || classType.find("LatentImage") != std::string::npos) &&
-            inputs->objVal.count("width") && inputs->objVal.count("height")) {
-            // Width/height are plain numbers in most graphs, but Flux2-style
-            // graphs route them through a separate PrimitiveInt node instead
-            // -- resolve through the same link-following helper as prompt text.
-            std::string wStr = ResolveTextField(nodesObj, inputs->objVal.at("width").get());
-            std::string hStr = ResolveTextField(nodesObj, inputs->objVal.at("height").get());
-            if (!wStr.empty() && !hStr.empty()) widthHeight = wStr + "x" + hStr;
+        if (classType == "EmptyLatentImage" || classType == "EmptySD3LatentImage" || classType.find("LatentImage") != std::string::npos) {
+            const auto* widthField = inputs->find("width");
+            const auto* heightField = inputs->find("height");
+            if (widthField && heightField) {
+                // Width/height are plain numbers in most graphs, but Flux2-style
+                // graphs route them through a separate PrimitiveInt node instead
+                // -- resolve through the same link-following helper as prompt text.
+                std::string wStr = ResolveTextField(nodesObj, widthField);
+                std::string hStr = ResolveTextField(nodesObj, heightField);
+                if (!wStr.empty() && !hStr.empty()) widthHeight = wStr + "x" + hStr;
+            }
         }
     }
 
@@ -1646,9 +1971,8 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     // (current) value instead of a stale one frozen inside the subgraph.
     std::vector<const SimpleJson::JsonValue*> subgraphDefs;
     if (const auto* defs = nodesObj->getObj("definitions")) {
-        if (defs->objVal.count("subgraphs")) {
-            const auto* sgVal = defs->objVal.at("subgraphs").get();
-            if (sgVal && sgVal->type == SimpleJson::JsonType::Array) {
+        if (const auto* sgVal = defs->find("subgraphs")) {
+            if (sgVal->type == SimpleJson::JsonType::Array) {
                 for (const auto& sg : sgVal->arrVal) if (sg) subgraphDefs.push_back(sg.get());
             } else if (sgVal && sgVal->type == SimpleJson::JsonType::Object) {
                 for (const auto& kv : sgVal->objVal) if (kv.second) subgraphDefs.push_back(kv.second.get());
@@ -1658,12 +1982,15 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
 
     SubgraphRegistry registry;
     for (const auto* sg : subgraphDefs) {
-        if (!sg || sg->type != SimpleJson::JsonType::Object || !sg->objVal.count("id")) continue;
-        std::string sgId = JsonIdToString(sg->objVal.at("id").get());
+        if (!sg || sg->type != SimpleJson::JsonType::Object) continue;
+        const auto* idField = sg->find("id");
+        if (!idField) continue;
+        std::string sgId = JsonIdToString(idField);
         if (!sgId.empty()) registry[sgId].def = sg;
     }
-    if (nodesObj->objVal.count("nodes") && nodesObj->objVal.at("nodes")->type == SimpleJson::JsonType::Array) {
-        for (const auto& n : nodesObj->objVal.at("nodes")->arrVal) {
+    const auto* topNodesField = nodesObj->find("nodes");
+    if (topNodesField && topNodesField->type == SimpleJson::JsonType::Array) {
+        for (const auto& n : topNodesField->arrVal) {
             if (!n || n->type != SimpleJson::JsonType::Object) continue;
             auto regIt = registry.find(n->getStr("type"));
             if (regIt != registry.end() && !regIt->second.instanceNode) regIt->second.instanceNode = n.get();
@@ -1690,7 +2017,8 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     UiLinkIndex linkIndex;
     CollectUiNodesAndLinks(nodesObj, "", linkIndex);
     for (const auto* sg : subgraphDefs) {
-        std::string sgId = (sg->objVal.count("id")) ? JsonIdToString(sg->objVal.at("id").get()) : "";
+        const auto* idField = sg->find("id");
+        std::string sgId = idField ? JsonIdToString(idField) : "";
         if (!subgraphInstanceActive(sgId)) continue;
         CollectUiNodesAndLinks(sg, sgId, linkIndex);
     }
@@ -1700,20 +2028,27 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     // subgraph feature moves the actual KSampler/CLIPTextEncode/etc. nodes
     // out of the top-level list into there, with the top level holding only
     // opaque subgraph-instance placeholder nodes.
-    if (nodesObj->objVal.count("nodes") && nodesObj->objVal.at("nodes")->type == SimpleJson::JsonType::Array) {
-        TraverseUiNodes(nodesObj->objVal.at("nodes")->arrVal, "", linkIndex, registry, info, ui);
+    if (topNodesField && topNodesField->type == SimpleJson::JsonType::Array) {
+        TraverseUiNodes(topNodesField->arrVal, "", linkIndex, registry, info, ui);
     }
     for (const auto* sg : subgraphDefs) {
-        if (!sg->objVal.count("nodes") || sg->objVal.at("nodes")->type != SimpleJson::JsonType::Array) continue;
-        std::string sgId = sg->objVal.count("id") ? JsonIdToString(sg->objVal.at("id").get()) : "";
+        const auto* sgNodesField = sg->find("nodes");
+        if (!sgNodesField || sgNodesField->type != SimpleJson::JsonType::Array) continue;
+        const auto* idField2 = sg->find("id");
+        std::string sgId = idField2 ? JsonIdToString(idField2) : "";
         if (!subgraphInstanceActive(sgId)) continue;
-        TraverseUiNodes(sg->objVal.at("nodes")->arrVal, sgId, linkIndex, registry, info, ui);
+        TraverseUiNodes(sgNodesField->arrVal, sgId, linkIndex, registry, info, ui);
     }
 
     // Link-resolved text wins over the "first/second CLIPTextEncode found"
     // guess made during traversal, mirroring resolvedPos/resolvedNeg above.
     if (!ui.uiResolvedPos.empty()) ui.posPromptText = ui.uiResolvedPos;
     if (!ui.uiResolvedNeg.empty()) ui.negPromptText = ui.uiResolvedNeg;
+
+    // UI-format traversal's LoRA findings only matter when the API-format
+    // ("prompt" chunk) loop above found none at all -- that loop runs over
+    // the authoritative execution graph whenever one is present.
+    if (loras.empty() && !ui.loras.empty()) loras = ui.loras;
 
     // modelName/vaeName alone aren't enough to call this a success: a loader
     // node is easy to find even when the real generation params live in node
@@ -1773,27 +2108,95 @@ bool AImgDecoder::DecodeEasyDiffusion(const SimpleJson::JsonValue* root, const s
     info.lora = Utf8ToWstring(root->getStr("use_lora_model"));
     info.sampler = Utf8ToWstring(root->getStr("sampler_name"));
 
-    if (root->objVal.count("seed")) {
-        info.seed = root->getInt64("seed");
+    if (const auto* v = root->find("seed")) {
+        info.seed = v->getInt64();
         info.has_seed = true;
     }
-    if (root->objVal.count("num_inference_steps")) {
-        info.steps = (int32_t)root->getInt64("num_inference_steps");
+    if (const auto* v = root->find("num_inference_steps")) {
+        info.steps = (int32_t)v->getInt64();
         info.has_steps = true;
     }
-    if (root->objVal.count("guidance_scale")) {
-        info.cfg_scale = root->getNum("guidance_scale");
+    if (const auto* v = root->find("guidance_scale")) {
+        info.cfg_scale = v->getNum();
         info.has_cfg = true;
     }
     // Easy Diffusion's "prompt_strength" (img2img mode only) is the same
     // concept as A1111's "Denoising strength": how much the source image is
     // allowed to change.
-    if (root->objVal.count("prompt_strength")) {
-        info.denoising_strength = root->getNum("prompt_strength");
+    if (const auto* v = root->find("prompt_strength")) {
+        info.denoising_strength = v->getNum();
         info.has_denoising_strength = true;
     }
 
     info.size = MakeSizeString(root->getInt64("width"), root->getInt64("height"));
+
+    info.full_parameters = Utf8ToWstring(originalText);
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Draw Things Decoder
+// ---------------------------------------------------------------------------
+
+namespace {
+// Renders a double compactly (e.g. 1.14, 0.9, 1) instead of raw float noise
+// (1.1399999856948853) -- used for LoRA weights, which Draw Things stores as
+// plain floats rather than pre-formatted text like A1111's "Lora hashes".
+std::string FormatCompactNumber(double v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", v);
+    std::string s(buf);
+    size_t dot = s.find('.');
+    if (dot != std::string::npos) {
+        size_t last = s.find_last_not_of('0');
+        if (last == dot) last--; // nothing left after the dot -- drop it too
+        s.erase(last + 1);
+    }
+    return s;
+}
+}
+
+bool AImgDecoder::DecodeDrawThings(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
+    if (!root || root->type != SimpleJson::JsonType::Object) return false;
+    // "seed_mode" is distinctly Draw Things' own vocabulary (e.g. "Scale
+    // Alike") -- no other supported generator's JSON uses this key.
+    if (!root->objVal.count("seed_mode")) return false;
+
+    info.has_metadata = true;
+    info.generator = L"Draw Things";
+    info.prompt = Utf8ToWstring(root->getStr("c"));
+    info.negative_prompt = Utf8ToWstring(root->getStr("uc"));
+    info.model = Utf8ToWstring(root->getStr("model"));
+    info.sampler = Utf8ToWstring(root->getStr("sampler"));
+    info.size = Utf8ToWstring(root->getStr("size"));
+
+    ExtractSeedCfgSteps(root, "scale", info);
+
+    if (const auto* v = root->find("strength")) {
+        info.denoising_strength = v->getNum();
+        info.has_denoising_strength = true;
+    }
+
+    if (const auto* v2 = root->getObj("v2")) {
+        if (const auto* clipSkipField = v2->find("clipSkip")) {
+            info.clip_skip = (int32_t)clipSkipField->getInt64();
+            info.has_clip_skip = true;
+        }
+    }
+
+    const auto* loraField = root->find("lora");
+    if (loraField && loraField->type == SimpleJson::JsonType::Array) {
+        std::string joined;
+        for (const auto& item : loraField->arrVal) {
+            if (!item || item->type != SimpleJson::JsonType::Object) continue;
+            std::string name = item->getStr("model");
+            if (name.empty()) continue;
+            if (!joined.empty()) joined += ", ";
+            joined += name + ": " + FormatCompactNumber(item->getNum("weight"));
+        }
+        if (!joined.empty()) info.lora = Utf8ToWstring(joined);
+    }
 
     info.full_parameters = Utf8ToWstring(originalText);
     return true;

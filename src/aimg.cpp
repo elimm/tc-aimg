@@ -230,6 +230,7 @@ struct FieldDef {
     int type;
     const wchar_t* units;
     FieldExtractor extract;
+    int flags = 0;
 };
 
 static const FieldDef g_Fields[] = {
@@ -239,14 +240,14 @@ static const FieldDef g_Fields[] = {
     { L"Prompt", ft_fulltextw, L"", [](const AImgInfo& info, CacheEntry& ce, int fi, void* fv, int maxlen) {
         if (info.prompt.empty()) return ft_fieldempty;
         return WriteFulltextChunk(ce, fi, info.prompt, fv, maxlen);
-    } }, // 1
+    }, contflags_fieldhint }, // 1
     { L"Prompt (Short)", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
         return WriteStringField(info.prompt, fv, maxlen);
     } }, // 2
     { L"Negative Prompt", ft_fulltextw, L"", [](const AImgInfo& info, CacheEntry& ce, int fi, void* fv, int maxlen) {
         if (info.negative_prompt.empty()) return ft_fieldempty;
         return WriteFulltextChunk(ce, fi, info.negative_prompt, fv, maxlen);
-    } }, // 3
+    }, contflags_fieldhint }, // 3
     { L"Negative Prompt (Short)", ft_stringw, L"", [](const AImgInfo& info, CacheEntry&, int, void* fv, int maxlen) {
         return WriteStringField(info.negative_prompt, fv, maxlen);
     } }, // 4
@@ -311,7 +312,7 @@ static const FieldDef g_Fields[] = {
     { L"Full Parameters", ft_fulltextw, L"", [](const AImgInfo& info, CacheEntry& ce, int fi, void* fv, int maxlen) {
         if (info.full_parameters.empty()) return ft_fieldempty;
         return WriteFulltextChunk(ce, fi, info.full_parameters, fv, maxlen);
-    } }, // 23
+    }, contflags_fieldhint }, // 23
     // Extractor is only reachable via ContentGetValueW's own FieldIndex == 24
     // special case below (it must run BEFORE the has_metadata guard, since
     // this field's whole point is to report has_metadata itself, including
@@ -331,7 +332,7 @@ int __stdcall ContentGetSupportedFieldW(int FieldIndex, WCHAR* FieldName, WCHAR*
     wcsncpy_s(FieldName, maxlen, g_Fields[FieldIndex].name, _TRUNCATE);
     wcsncpy_s(Units, maxlen, g_Fields[FieldIndex].units, _TRUNCATE);
 
-    return g_Fields[FieldIndex].type;
+    return g_Fields[FieldIndex].type | g_Fields[FieldIndex].flags;
 }
 
 int __stdcall ContentGetSupportedField(int FieldIndex, char* FieldName, char* Units, int maxlen) {
@@ -341,9 +342,10 @@ int __stdcall ContentGetSupportedField(int FieldIndex, char* FieldName, char* Un
     WideCharToMultiByte(CP_ACP, 0, g_Fields[FieldIndex].units, -1, Units, maxlen, NULL, NULL);
 
     int type = g_Fields[FieldIndex].type;
-    if (type == ft_stringw) return ft_string;
-    if (type == ft_fulltextw) return ft_fulltext;
-    return type;
+    int flags = g_Fields[FieldIndex].flags;
+    if (type == ft_stringw) return ft_string | flags;
+    if (type == ft_fulltextw) return ft_fulltext | flags;
+    return type | flags;
 }
 
 int __stdcall ContentGetValueW(WCHAR* FileName, int FieldIndex, int UnitIndex, void* FieldValue, int maxlen, int flags) {

@@ -370,16 +370,24 @@ bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetad
 // ---------------------------------------------------------------------------
 
 // Shared by zTXt (always zlib-compressed) and iTXt (optionally compressed):
-// either zlib-inflate `data` or store it as-is, keyed by `key`.
-static void StorePngText(RawImageMetadata& outMetadata, const std::string& key,
-                          const uint8_t* data, size_t len, bool compressed) {
+// either zlib-inflate `data` or copy it as-is into `out`. Returns false if
+// `compressed` was requested and inflation failed (nothing to store).
+static bool DecodePngText(const uint8_t* data, size_t len, bool compressed, std::string& out) {
     if (compressed) {
         std::vector<uint8_t> decompressed;
-        if (TinyDeflate::InflateZlib(data, len, decompressed)) {
-            outMetadata.text_chunks[key] = std::string((const char*)decompressed.data(), decompressed.size());
-        }
+        if (!TinyDeflate::InflateZlib(data, len, decompressed)) return false;
+        out.assign((const char*)decompressed.data(), decompressed.size());
     } else {
-        outMetadata.text_chunks[key] = std::string((const char*)data, len);
+        out.assign((const char*)data, len);
+    }
+    return true;
+}
+
+static void StorePngText(RawImageMetadata& outMetadata, const std::string& key,
+                          const uint8_t* data, size_t len, bool compressed) {
+    std::string text;
+    if (DecodePngText(data, len, compressed, text)) {
+        outMetadata.text_chunks[key] = std::move(text);
     }
 }
 
@@ -455,7 +463,23 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
 
                     if (ptr <= end) {
                         size_t textLen = end - ptr;
-                        StorePngText(outMetadata, key, ptr, textLen, /*compressed=*/(compFlag == 1 && compMethod == 0));
+                        bool compressed = (compFlag == 1 && compMethod == 0);
+                        // PNG's conventional home for an embedded XMP packet
+                        // (keyword "XML:com.adobe.xmp", per the XMP spec) --
+                        // route through ParseXMP the same way JPEG/WebP/AVIF's
+                        // XMP segments/chunks/boxes already do, instead of
+                        // dumping the whole raw XML/RDF text verbatim under
+                        // this literal keyword (which would otherwise make it
+                        // a candidate for the generic A1111/Fooocus text
+                        // matchers below -- see DecodeCore's "xmp" key skip).
+                        if (key == "XML:com.adobe.xmp") {
+                            std::string text;
+                            if (DecodePngText(ptr, textLen, compressed, text)) {
+                                ParseXMP(text, outMetadata);
+                            }
+                        } else {
+                            StorePngText(outMetadata, key, ptr, textLen, compressed);
+                        }
                     }
                 }
             } else if (chunkType == "eXIf") {

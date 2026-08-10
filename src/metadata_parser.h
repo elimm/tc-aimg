@@ -21,7 +21,8 @@ struct RawImageMetadata {
     // FIRST candidate in iteration order is tried first. std::map's
     // alphabetical order happens to put "prompt" (the authoritative
     // API/execution-format graph) before "workflow" (a live UI snapshot that
-    // can disagree on seed on control_after_generate seeds). An
+    // can disagree on seed on control_after_generate seeds -- see the
+    // seed-fallback comment in aimg_decoder.cpp's DecodeComfyUI for why). An
     // unordered_map would make that ordering hash-dependent and could
     // silently flip which chunk wins.
     std::map<std::string, std::string> text_chunks;
