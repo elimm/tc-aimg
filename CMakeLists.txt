@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.13) # target_link_options() requires 3.13+
 # Keep this VERSION in sync with src/aimg_version.h (AIMG_VERSION_MAJOR/MINOR/
 # PATCH) and pluginst.inf's `version=` key -- not consumed by the build itself,
 # just kept aligned by hand for consistency.
-project(aimg VERSION 0.1.1 LANGUAGES CXX C RC)
+project(aimg VERSION 0.1.2 LANGUAGES CXX C RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
