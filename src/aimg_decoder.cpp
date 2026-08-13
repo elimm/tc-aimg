@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cctype>
 #include <cwctype>
 #include <cwchar>
@@ -33,14 +34,21 @@ struct JsonValue {
     bool boolVal = false;
     double numVal = 0.0;
     std::string strVal;
-    std::vector<std::shared_ptr<JsonValue>> arrVal;
+    // unique_ptr, not shared_ptr: ownership here is strictly tree-exclusive
+    // (every node has exactly one parent, down to Candidate::json at the
+    // root) -- nothing in this file ever copies a JsonValue pointer for
+    // extended/aliased lifetime, only raw `const JsonValue*` views into the
+    // tree that some owner elsewhere keeps alive. unique_ptr drops the
+    // control-block allocation and atomic refcount inc/dec per node that
+    // shared_ptr would otherwise pay on a 150+-node ComfyUI graph.
+    std::vector<std::unique_ptr<JsonValue>> arrVal;
     // std::map, not unordered_map: measured with tests/run_benchmark.bat --
     // ComfyUI workflow JSON creates hundreds of small per-node objects (a
     // handful of keys each), and unordered_map's extra per-instance bucket-
     // array allocation loses to std::map's single tree-node allocation at
     // this N, both in speed (~2x slower on a 150-node graph) and in binary
     // size (more template instantiation for hashing/rehashing machinery).
-    std::map<std::string, std::shared_ptr<JsonValue>> objVal;
+    std::map<std::string, std::unique_ptr<JsonValue>> objVal;
 
     std::string getStr(const std::string& key = "") const {
         if (key.empty()) return type == JsonType::String ? strVal : "";
@@ -166,12 +174,12 @@ class JsonParser {
 public:
     JsonParser(const std::string& json) : src(json) {}
 
-    std::shared_ptr<JsonValue> parse() {
+    std::unique_ptr<JsonValue> parse() {
         skipWS();
         if (pos >= src.size()) return nullptr;
         if (depth >= kMaxDepth) return nullptr; // guard against stack overflow on deeply-nested/adversarial JSON
 
-        auto val = std::make_shared<JsonValue>();
+        auto val = std::make_unique<JsonValue>();
         char c = src[pos];
 
         if (c == '{') {
@@ -278,12 +286,41 @@ std::string AImgDecoder::Trim(const std::string& str) {
 }
 
 // Used only by the last-resort "any text in a comment-like field is a
-// prompt" fallback in DecodeCore: some non-AI tools (e.g. JPEGmini's JPEG
-// re-compression) write their own signature into the same COM/EXIF fields a
-// text-to-image generator would use for a freeform prompt, e.g. "Optimized by
-// JPEGmini 3.13.0.4 0x7ff7a08" -- a raw memory address literal is a giveaway
-// of build/diagnostic text, never legitimate prompt content, so reject any
-// candidate containing one rather than mislabeling the file as AI-generated.
+// prompt" fallback in DecodeCore: some non-AI tools write their own
+// signature/boilerplate into the same COM/EXIF/Comment fields a text-to-image
+// generator would use for a freeform prompt, so this needs both negative
+// checks (reject known non-prompt shapes) and positive evidence (require
+// prose/tag-list shape) before accepting text as a real prompt.
+//  - A raw memory address literal (e.g. a hex address in some tool's own
+//    re-compression/build signature) is a giveaway of build/diagnostic
+//    text, never legitimate prompt content.
+//  - JSON that reached this catch-all has already failed every real
+//    generator's structural decoder earlier in DecodeCore (ComfyUI/InvokeAI/
+//    SwarmUI/NovelAI/Draw Things all parse valid JSON), so any leftover
+//    JSON-looking blob (e.g. a third-party app's own remix/config payload)
+//    is data that failed to match, not a prompt to guess at.
+//  - Opaque signature/watermark strings (e.g. "Signature: <base64 blob>")
+//    and short generic tool boilerplate (e.g. "Created with GIMP") aren't
+//    prose: requiring at least a handful of comma/whitespace-separated
+//    tokens rejects both while still accepting real prompts, which are
+//    either natural-language sentences or A1111-style comma-separated tags.
+// Narrower than LooksLikeGenerationText (which also rejects short/low-token
+// text -- too strict for a real CLIPTextEncode prompt, which can legitimately
+// be a single short tag like "ballgag,"): rejects only text whose first
+// non-whitespace character is '{'/'[' -- some custom "rich prompt editor"
+// ComfyUI node packs serialize their internal token/tag editor state as JSON
+// directly into the CLIPTextEncode node's own "text" widget (rather than a
+// plain string), which ResolveTextField/FirstWidgetString would otherwise
+// accept as a literal prompt with no way to tell it apart from real text.
+// Used only at the point a resolved widget value is about to become the
+// final prompt/negative_prompt -- a companion A1111-style text block, when
+// present, still supplies the real prompt via DecodeCore's MergeGaps gap-fill
+// once this guard leaves ui.posPromptText empty instead of JSON garbage.
+static bool LooksLikeSerializedTextBlob(const std::string& s) {
+    size_t firstNonSpace = s.find_first_not_of(" \t\r\n");
+    return firstNonSpace != std::string::npos && (s[firstNonSpace] == '{' || s[firstNonSpace] == '[');
+}
+
 static bool LooksLikeGenerationText(const std::string& s) {
     if (s.size() < 15) return false;
     size_t hexPos = s.find("0x");
@@ -294,6 +331,21 @@ static bool LooksLikeGenerationText(const std::string& s) {
         if (hexDigits >= 5) return false;
         hexPos = s.find("0x", hexPos + 2);
     }
+
+    size_t firstNonSpace = s.find_first_not_of(" \t\r\n");
+    if (firstNonSpace != std::string::npos && (s[firstNonSpace] == '{' || s[firstNonSpace] == '[')) return false;
+
+    static const char kTokenSeparators[] = " \t\r\n,\0"; // NUL-inclusive overload, see Trim() above
+    int tokenCount = 0;
+    size_t pos = s.find_first_not_of(kTokenSeparators, 0, sizeof(kTokenSeparators));
+    while (pos != std::string::npos) {
+        tokenCount++;
+        size_t next = s.find_first_of(kTokenSeparators, pos, sizeof(kTokenSeparators));
+        pos = (next == std::string::npos) ? std::string::npos
+                                           : s.find_first_not_of(kTokenSeparators, next, sizeof(kTokenSeparators));
+    }
+    if (tokenCount < 4) return false;
+
     return true;
 }
 
@@ -422,7 +474,7 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
     struct Candidate {
         std::string key;
         std::string text;
-        std::shared_ptr<SimpleJson::JsonValue> json;
+        std::unique_ptr<SimpleJson::JsonValue> json;
         bool jsonAttempted = false;
     };
     std::vector<Candidate> candidates;
@@ -469,7 +521,7 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
                 SimpleJson::JsonParser parser(jsonSlice);
                 auto root = parser.parse();
                 if (root && root->type == SimpleJson::JsonType::Object) {
-                    cand.json = root;
+                    cand.json = std::move(root);
                 }
             }
         }
@@ -557,15 +609,15 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
         }
     }
 
-    // 4-7. Try Easy Diffusion, then InvokeAI, then SwarmUI, then NovelAI --
-    // same signature, so one generator-major/candidate-minor loop replaces
-    // four near-identical ones. Order matters and must stay exactly this:
-    // Easy Diffusion before InvokeAI, since Easy Diffusion's own JSON schema
-    // also has a "negative_prompt" key that would otherwise satisfy
-    // InvokeAI's (looser) gate and mislabel the generator.
+    // 4-8. Try Easy Diffusion, then WanGP, then InvokeAI, then SwarmUI, then
+    // NovelAI -- same signature, so one generator-major/candidate-minor loop
+    // replaces five near-identical ones. Order matters and must stay exactly
+    // this: both Easy Diffusion and WanGP before InvokeAI, since both of
+    // their own JSON schemas also carry a "negative_prompt" key that would
+    // otherwise satisfy InvokeAI's gate and mislabel the generator.
     using JsonGeneratorDecodeFn = bool (*)(const SimpleJson::JsonValue*, const std::string&, AImgInfo&);
     static const JsonGeneratorDecodeFn kJsonGeneratorDecoders[] = {
-        DecodeEasyDiffusion, DecodeInvokeAI, DecodeSwarmUI, DecodeNovelAI
+        DecodeEasyDiffusion, DecodeWanGP, DecodeInvokeAI, DecodeSwarmUI, DecodeNovelAI
     };
     for (auto decodeFn : kJsonGeneratorDecoders) {
         for (auto& cand : candidates) {
@@ -645,6 +697,29 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
     info.negative_prompt = Utf8ToWstring(Trim(negPrompt));
 
     std::string civitaiResources;
+    // ComfyUI's A1111-compat "Save Image w/ Metadata"-style node (and some
+    // CivitAI-generated files) write a "Hashes" key whose value is a raw JSON
+    // object ({"model":"<hash>","LORA:<name>":"<hash>",...}) rather than the
+    // quoted comma-separated sub-list "Lora hashes"/"Loras" use below. Its
+    // internal quote pairs are balanced per "key":"value" entry, so the
+    // quote-aware comma splitter below still treats each internal comma as a
+    // top-level split point and silently drops every LORA entry -- pull the
+    // whole {...} span out here via brace matching before that loop runs, so
+    // it can be parsed as JSON afterwards instead.
+    std::string hashesJson;
+    {
+        size_t hPos = paramsLine.find("Hashes: {");
+        if (hPos != std::string::npos) {
+            size_t braceStart = hPos + 8;
+            int depth = 0;
+            size_t i = braceStart;
+            for (; i < paramsLine.size(); i++) {
+                if (paramsLine[i] == '{') depth++;
+                else if (paramsLine[i] == '}') { depth--; if (depth == 0) { i++; break; } }
+            }
+            if (depth == 0) hashesJson = paramsLine.substr(braceStart, i - braceStart);
+        }
+    }
     // Forge-neo builds (Version: neo...) drop the classic "VAE:" key and
     // instead log auxiliary components -- VAE, text encoders, etc. -- as an
     // unordered numbered list ("Module 1:", "Module 2:", ...) with no fixed
@@ -668,58 +743,80 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
             }
             return std::string::npos;
         };
+        // Compares the trimmed key span directly against a literal without
+        // materializing a std::string per key -- this loop runs on every
+        // A1111/SD.Next/Forge file (15+ keys each), so avoiding a per-key
+        // allocation here is worth the extra indirection. `v` still needs a
+        // real std::string (Utf8ToWstring/atoi/atof/rfind all require one),
+        // but is now trimmed via index math instead of substr+Trim's own
+        // possible extra copy.
+        auto isWs = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
         size_t start = 0;
         while (start < paramsLine.size()) {
             size_t nextComma = findNextComma(start);
             if (nextComma == std::string::npos) nextComma = paramsLine.size();
 
-            std::string item = paramsLine.substr(start, nextComma - start);
-            size_t colon = item.find(": ");
-            if (colon != std::string::npos) {
-                std::string k = Trim(item.substr(0, colon));
-                std::string v = Trim(item.substr(colon + 2));
+            size_t colon = paramsLine.find(": ", start);
+            if (colon != std::string::npos && colon < nextComma) {
+                size_t kStart = start, kEnd = colon;
+                while (kStart < kEnd && isWs(paramsLine[kStart])) kStart++;
+                while (kEnd > kStart && isWs(paramsLine[kEnd - 1])) kEnd--;
+                size_t kLen = kEnd - kStart;
+                auto keyIs = [&](const char* lit) {
+                    size_t litLen = strlen(lit);
+                    return kLen == litLen && paramsLine.compare(kStart, kLen, lit, litLen) == 0;
+                };
+                auto keyStartsWith = [&](const char* lit) {
+                    size_t litLen = strlen(lit);
+                    return kLen >= litLen && paramsLine.compare(kStart, litLen, lit, litLen) == 0;
+                };
 
-                if (k == "Steps") {
+                size_t vStart = colon + 2, vEnd = nextComma;
+                while (vStart < vEnd && isWs(paramsLine[vStart])) vStart++;
+                while (vEnd > vStart && isWs(paramsLine[vEnd - 1])) vEnd--;
+                std::string v = paramsLine.substr(vStart, vEnd - vStart);
+
+                if (keyIs("Steps")) {
                     info.steps = atoi(v.c_str());
                     info.has_steps = true;
-                } else if (k == "Sampler") {
+                } else if (keyIs("Sampler")) {
                     info.sampler = Utf8ToWstring(v);
-                } else if (k == "Schedule type" || k == "Scheduler") {
+                } else if (keyIs("Schedule type") || keyIs("Scheduler")) {
                     info.scheduler = Utf8ToWstring(v);
-                } else if (k == "CFG scale") {
+                } else if (keyIs("CFG scale")) {
                     info.cfg_scale = atof(v.c_str());
                     info.has_cfg = true;
-                } else if (k == "Seed") {
+                } else if (keyIs("Seed")) {
                     info.seed = _strtoui64(v.c_str(), NULL, 10);
                     info.has_seed = true;
-                } else if (k == "Size") {
+                } else if (keyIs("Size")) {
                     info.size = Utf8ToWstring(v);
-                } else if (k == "Model") {
+                } else if (keyIs("Model")) {
                     info.model = Utf8ToWstring(v);
-                } else if (k == "Model hash") {
+                } else if (keyIs("Model hash")) {
                     info.model_hash = Utf8ToWstring(v);
-                } else if (k == "Clip skip") {
+                } else if (keyIs("Clip skip")) {
                     info.clip_skip = atoi(v.c_str());
                     info.has_clip_skip = true;
-                } else if (k == "Denoising strength") {
+                } else if (keyIs("Denoising strength")) {
                     info.denoising_strength = atof(v.c_str());
                     info.has_denoising_strength = true;
-                } else if (k == "Hires upscale") {
+                } else if (keyIs("Hires upscale")) {
                     info.hires_upscale = Utf8ToWstring(v);
-                } else if (k == "Hires upscaler") {
+                } else if (keyIs("Hires upscaler")) {
                     info.hires_upscaler = Utf8ToWstring(v);
-                } else if (k == "Hires steps") {
+                } else if (keyIs("Hires steps")) {
                     info.hires_steps = atoi(v.c_str());
                     info.has_hires_steps = true;
-                } else if (k == "VAE") {
+                } else if (keyIs("VAE")) {
                     info.vae = Utf8ToWstring(v);
-                } else if (k == "Lora hashes" || k == "Loras") {
+                } else if (keyIs("Lora hashes") || keyIs("Loras")) {
                     info.lora = Utf8ToWstring(v);
-                } else if (k == "Civitai resources") {
+                } else if (keyIs("Civitai resources")) {
                     civitaiResources = v;
-                } else if (moduleVaeCandidate.empty() && k.rfind("Module ", 0) == 0) {
+                } else if (moduleVaeCandidate.empty() && keyStartsWith("Module ")) {
                     moduleVaeCandidate = Utf8ToWstring(v);
-                } else if (k == "Version") {
+                } else if (keyIs("Version")) {
                     // WebUI Forge rebrands its own "Version:" value distinctly
                     // from stock A1111/SD.Next -- classic Forge uses "f<ver>v<...>"
                     // (e.g. "f2.0.1v1.10.1-previous-639-ga2302538"), Forge-neo
@@ -737,6 +834,25 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
     }
     if (info.vae.empty() && !moduleVaeCandidate.empty()) {
         info.vae = moduleVaeCandidate;
+    }
+
+    // Only used when no "Lora hashes"/"Loras" key already populated info.lora
+    // -- those are the real A1111 convention and take priority when present.
+    if (info.lora.empty() && !hashesJson.empty()) {
+        SimpleJson::JsonParser parser(hashesJson);
+        auto root = parser.parse();
+        if (root && root->type == SimpleJson::JsonType::Object) {
+            std::string joined;
+            for (const auto& kv : root->objVal) {
+                if (kv.first.rfind("LORA:", 0) != 0) continue;
+                std::string name = kv.first.substr(5);
+                std::string hash = (kv.second && kv.second->type == SimpleJson::JsonType::String) ? kv.second->strVal : "";
+                if (!joined.empty()) joined += ", ";
+                joined += name;
+                if (!hash.empty()) joined += ": " + hash;
+            }
+            if (!joined.empty()) info.lora = Utf8ToWstring(joined);
+        }
     }
 
     // CivitAI's own generation UI omits the classic "Model:"/"Model hash:"
@@ -925,6 +1041,27 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
         }
         return "";
     }
+    if (classType == "Flux_Finish_StylesStyler") {
+        // A custom Flux prompt/style-preset node whose CONDITIONING output is
+        // fed by a "text_positive"/"text_negative" pair rather than the
+        // generic "text"/"value" keys the stock-fallback below checks --
+        // "text_positive" is the one actually wired into a CLIPTextEncode's
+        // "text" input in every real sample seen, so prefer it.
+        std::string positive = refInputs->getStr("text_positive");
+        if (!positive.empty()) return positive;
+        return refInputs->getStr("text_negative");
+    }
+    if (classType == "ImpactWildcardProcessor") {
+        // Impact Pack's wildcard-prompt node keeps the AUTHORED text (with
+        // unresolved "{a|b|c}" alternatives still in it) under
+        // "wildcard_text" and the text actually used for this generation --
+        // wildcards expanded, regardless of "mode" ("populate"/"reproduce")
+        // -- under "populated_text". The stock "text"/"value" fallback below
+        // would find neither key and return empty.
+        std::string populated = refInputs->getStr("populated_text");
+        if (!populated.empty()) return populated;
+        return refInputs->getStr("wildcard_text");
+    }
 
     // A "Selector"-style helper node commonly reuses the outer field's own
     // name (e.g. a "Sampler Selector" node's "sampler_name") for its literal,
@@ -1001,6 +1138,18 @@ std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId
     if (it == nodesObj->objVal.end() || !it->second) return "";
     const auto* refInputs = it->second->getObj("inputs");
     if (!refInputs) return "";
+    // Efficiency-Nodes' "Get Booru Tag" concatenates up to 3 STRING inputs
+    // (text_a/text_b/text_c, each possibly literal or itself linked) with no
+    // separate "text" field of its own -- the fields already carry their own
+    // trailing punctuation/whitespace in real files, so join with nothing in
+    // between rather than guessing a delimiter.
+    if (it->second->getStr("class_type").find("Get Booru Tag") != std::string::npos) {
+        std::string joined;
+        for (const char* key : {"text_a", "text_b", "text_c"}) {
+            if (const JsonValue* v = refInputs->find(key)) joined += ResolveTextField(nodesObj, v);
+        }
+        if (!joined.empty()) return joined;
+    }
     if (const JsonValue* v = refInputs->find("text")) {
         return ResolveTextField(nodesObj, v);
     }
@@ -1024,6 +1173,20 @@ std::string FirstWidgetString(const JsonValue* node, int skip = 0) {
     const JsonValue* wv = node ? node->find("widgets_values") : nullptr;
     if (!wv || wv->type != JsonType::Array) return "";
     for (const auto& v : wv->arrVal) {
+        // Some custom "rich prompt editor" node packs (e.g. "WeiLinPromptUI")
+        // serialize their internal token/tag editor state as a JSON array/
+        // object directly into their own widgets_values, rather than the
+        // plain text a real CLIPTextEncode-equivalent node holds. Every
+        // caller here wants literal prompt text -- stop and return "" the
+        // moment such a blob is found, rather than skipping past it to keep
+        // scanning: on this node type the prompt editor's real serialized
+        // state IS this entry, so whatever non-empty string happens to
+        // follow it (observed in the wild: a session id/timestamp widget)
+        // is unrelated settings data, not a plausible second guess. This is
+        // different from a non-string entry (e.g. a LoRA-manager-style
+        // node's metadata object prefix, see below) which legitimately just
+        // isn't the text and is fine to skip past.
+        if (v && v->type == JsonType::String && !v->strVal.empty() && LooksLikeSerializedTextBlob(v->strVal)) return "";
         if (v && v->type == JsonType::String && !v->strVal.empty()) {
             if (skip > 0) { skip--; continue; }
             return v->strVal;
@@ -1320,23 +1483,21 @@ int ResolveUiBoolLink(const std::string& scopeId, int64_t linkId, const UiLinkIn
     return -1;
 }
 
-// Follows a CLIPTextEncode "text" input's link through pass-through/prompt-
-// routing nodes (Reroute, PreviewAny, Primitive string nodes,
-// StringConcatenate, ComfySwitchNode) to the literal text feeding it --
-// prompt-enhancement/LoRA-trigger workflows route text through several of
-// these, leaving widgets_values[0] a stale placeholder otherwise. Bounded
-// depth guards against cycles in malformed graphs. Also checks, before
-// anything else, whether this link crosses a subgraph boundary (see
-// TryResolveBoundary) -- a promoted text widget's real value lives on the
-// subgraph's instantiating node, not on whatever node the link nominally
-// points at inside the subgraph.
-std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index,
-                                      const SubgraphRegistry& registry, int depth) {
-    if (depth > 6) return "";
-    if (const JsonValue* boundaryVal = TryResolveBoundary(scopeId, linkId, index, registry)) {
-        return boundaryVal->type == JsonType::String ? boundaryVal->strVal : "";
-    }
-    const JsonValue* node = ResolveLinkNode(scopeId, linkId, index);
+// Dispatches on a UI-format node's own type to resolve its pass-through/
+// prompt-routing text (Reroute, PreviewAny, Primitive string nodes,
+// StringConcatenate, "Text Concatenate" [pysssss/comfyui-custom-scripts,
+// 4-input text_a..text_d + delimiter widget], ComfySwitchNode), given the
+// node itself rather than a link pointing at it. Split out of
+// ResolveUiTextThroughLink so ResolveUiLinkText (which already has the
+// origin node in hand after following a KSampler-type "positive"/"negative"
+// link) can share the same safe node-type dispatch instead of falling
+// straight to FirstWidgetString() -- blindly taking a join/passthrough
+// node's first string widget grabs things like a "Text Concatenate" node's
+// own delimiter widget (e.g. ", ") instead of the text it actually passes
+// through. Returns "" for any node type not explicitly recognized here,
+// exactly like the original inline dispatch did.
+std::string ResolveNodeTextByType(const JsonValue* node, const std::string& scopeId, const UiLinkIndex& index,
+                                   const SubgraphRegistry& registry, int depth) {
     if (!node) return "";
     std::string typeStr = node->getStr("type");
 
@@ -1411,6 +1572,52 @@ std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId,
         return "";
     }
 
+    if (typeStr == "Flux_Finish_StylesStyler") {
+        std::string positive = NamedWidgetString(node, "text_positive");
+        if (!positive.empty()) return positive;
+        return NamedWidgetString(node, "text_negative");
+    }
+
+    if (typeStr == "ImpactWildcardProcessor") {
+        // Same rationale as the API-format branch in ResolveTextField:
+        // "populated_text" is the wildcard-expanded text actually used for
+        // this generation, "wildcard_text" is the authored template (may
+        // still contain unresolved "{a|b|c}" alternatives). NamedWidgetString
+        // reads a UI-format node's widget-backed input by name the same way
+        // the "text"/"prompt" fields are read elsewhere in this dispatch.
+        std::string populated = NamedWidgetString(node, "populated_text");
+        if (!populated.empty()) return populated;
+        return NamedWidgetString(node, "wildcard_text");
+    }
+
+    if (typeStr == "Text Concatenate") {
+        // pysssss/comfyui-custom-scripts' "Text Concatenate": up to 4 STRING
+        // inputs (text_a..text_d, any of which may be unwired) joined with a
+        // delimiter -- unlike StringConcatenate's delimiter being a fixed
+        // 3rd widgets_values slot alongside two inputs, here EVERY text_*
+        // input can be a socket, so widgets_values may hold only
+        // [delimiter, clean_whitespace] with no text at all; naively taking
+        // FirstWidgetString() on this node grabs the delimiter string itself
+        // (e.g. ", ") instead of the joined text.
+        std::string sep;
+        if (const JsonValue* wvField = node->find("widgets_values")) {
+            if (wvField->type == JsonType::Array) {
+                const auto& w = wvField->arrVal;
+                if (!w.empty() && w[0] && w[0]->type == JsonType::String) sep = w[0]->strVal;
+            }
+        }
+        std::string joined;
+        for (const char* inName : {"text_a", "text_b", "text_c", "text_d"}) {
+            int64_t partLink;
+            if (!GetNodeInputLink(node, inName, partLink)) continue;
+            std::string part = ResolveUiTextThroughLink(scopeId, partLink, index, registry, depth + 1);
+            if (part.empty()) continue;
+            if (!joined.empty()) joined += sep;
+            joined += part;
+        }
+        return joined;
+    }
+
     // Literal source: only node types whose entire purpose is to carry a
     // fixed string literal (regardless of whether that widget was also
     // exposed as an input socket for a parent subgraph to wire from
@@ -1421,10 +1628,44 @@ std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId,
     // contains other string-typed settings (e.g. a "on"/"off" toggle), and
     // grabbing the first one produces a confidently wrong one-word "prompt"
     // instead of an honest empty result the caller can fall back from.
-    if (typeStr == "PrimitiveString" || typeStr == "PrimitiveStringMultiline") {
+    if (typeStr == "PrimitiveString" || typeStr == "PrimitiveStringMultiline" || typeStr == "Text Multiline") {
         return FirstWidgetString(node);
     }
     return "";
+}
+
+// Node types ResolveNodeTextByType has an explicit dispatch branch for. Used
+// by ResolveUiLinkText to tell "this IS a join/passthrough node, but its
+// inputs happened to resolve empty" (return "") apart from "this is some
+// other node type ResolveNodeTextByType doesn't recognize at all" (fall back
+// to FirstWidgetString, since that's the ordinary literal-CLIPTextEncode
+// case). Without this distinction, a "Text Concatenate"/StringConcatenate/
+// ComfySwitchNode/Reroute node whose real upstream text couldn't be resolved
+// (e.g. it flows through another unrecognized custom node) would fall
+// through to FirstWidgetString and grab that join node's OWN delimiter or
+// toggle widget instead of an honest empty result.
+bool IsKnownPassthroughNodeType(const std::string& typeStr) {
+    return typeStr == "ComfySwitchNode" || typeStr == "StringConcatenate" || typeStr == "Text Concatenate" ||
+           typeStr == "Reroute" || typeStr == "PreviewAny";
+}
+
+// Follows a CLIPTextEncode "text" input's link through pass-through/prompt-
+// routing nodes (see ResolveNodeTextByType) to the literal text feeding it --
+// prompt-enhancement/LoRA-trigger workflows route text through several of
+// these, leaving widgets_values[0] a stale placeholder otherwise. Bounded
+// depth guards against cycles in malformed graphs. Also checks, before
+// anything else, whether this link crosses a subgraph boundary (see
+// TryResolveBoundary) -- a promoted text widget's real value lives on the
+// subgraph's instantiating node, not on whatever node the link nominally
+// points at inside the subgraph.
+std::string ResolveUiTextThroughLink(const std::string& scopeId, int64_t linkId, const UiLinkIndex& index,
+                                      const SubgraphRegistry& registry, int depth) {
+    if (depth > 6) return "";
+    if (const JsonValue* boundaryVal = TryResolveBoundary(scopeId, linkId, index, registry)) {
+        return boundaryVal->type == JsonType::String ? boundaryVal->strVal : "";
+    }
+    const JsonValue* node = ResolveLinkNode(scopeId, linkId, index);
+    return ResolveNodeTextByType(node, scopeId, index, registry, depth);
 }
 
 // Resolves a KSampler-type node's "positive"/"negative" CONDITIONING link to
@@ -1451,6 +1692,16 @@ std::string ResolveUiLinkText(const std::string& scopeId, int64_t linkId, const 
         std::string t = ResolveUiTextThroughLink(scopeId, fieldLink, index, registry, 0);
         if (!t.empty()) return t;
     }
+    // The origin node itself may be a join/passthrough node (e.g. "Text
+    // Concatenate", StringConcatenate, Reroute) directly wired into the
+    // sampler's "positive"/"negative" input rather than through an
+    // intermediate CLIPTextEncode -- resolve via the same safe node-type
+    // dispatch ResolveUiTextThroughLink uses before falling back to
+    // FirstWidgetString(), which would otherwise grab a join node's own
+    // delimiter/toggle widget instead of the text it passes through.
+    std::string passthrough = ResolveNodeTextByType(node, scopeId, index, registry, 0);
+    if (!passthrough.empty()) return passthrough;
+    if (IsKnownPassthroughNodeType(node->getStr("type"))) return "";
     return FirstWidgetString(node, skip);
 }
 
@@ -1517,7 +1768,7 @@ bool TryBoundaryString(const JsonValue* node, const char* inputName, const std::
     return true;
 }
 
-void ApplyWidgetFieldMap(const JsonValue* node, const WidgetFieldMap& m, const std::vector<std::shared_ptr<JsonValue>>& wArr,
+void ApplyWidgetFieldMap(const JsonValue* node, const WidgetFieldMap& m, const std::vector<std::unique_ptr<JsonValue>>& wArr,
                           const std::string& scopeId, const UiLinkIndex& index, const SubgraphRegistry& registry,
                           AImgInfo& info, std::string& samplerName, std::string& schedulerName) {
     double num;
@@ -1595,7 +1846,7 @@ bool IsNodeDisabled(const JsonValue* node) {
 // KSampler/CLIPTextEncode/etc. nodes out of the top-level list into
 // definitions.subgraphs[].nodes, with the top level holding only opaque
 // subgraph-instance placeholder nodes.
-void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray, const std::string& scopeId,
+void TraverseUiNodes(const std::vector<std::unique_ptr<JsonValue>>& nodesArray, const std::string& scopeId,
                       const UiLinkIndex& linkIndex, const SubgraphRegistry& registry, AImgInfo& info, ComfyUiExtraction& out) {
     for (const auto& item : nodesArray) {
         if (!item || item->type != JsonType::Object) continue;
@@ -1677,7 +1928,8 @@ void TraverseUiNodes(const std::vector<std::shared_ptr<JsonValue>>& nodesArray, 
                     text = ResolveUiTextThroughLink(scopeId, promptLink, linkIndex, registry, 0);
                 }
             }
-            if (text.empty() && !wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String) {
+            if (text.empty() && !wArr.empty() && wArr[0] && wArr[0]->type == JsonType::String &&
+                !LooksLikeSerializedTextBlob(wArr[0]->strVal)) {
                 text = wArr[0]->strVal;
             }
             if (negFromNamedField.empty()) negFromNamedField = NamedWidgetString(item.get(), "negative_prompt");
@@ -1764,30 +2016,15 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     // ComfyUI. Without this, any unrelated JSON object -- including
     // InvokeAI/SwarmUI/NovelAI's own metadata JSON -- would match here first
     // (this is the first generator tried) and those decoders would never run.
+    // Folded into the API-format extraction loop below (same objVal walk)
+    // rather than a separate up-front pass: every extraction branch already
+    // requires a non-empty "class_type" plus an "inputs" object to do
+    // anything, so any node that would cause a write here also satisfies
+    // the detection condition -- meaning looksLikeComfyGraph is guaranteed
+    // true before info is ever touched, and the second (UI-format "nodes"
+    // array) detection path below is untouched, so this only saves the
+    // second full objVal walk on the common, large API-format case.
     bool looksLikeComfyGraph = false;
-    for (const auto& pair : nodesObj->objVal) {
-        const auto* node = pair.second.get();
-        if (node && node->type == SimpleJson::JsonType::Object &&
-            !node->getStr("class_type").empty() && node->getObj("inputs")) {
-            looksLikeComfyGraph = true;
-            break;
-        }
-    }
-    if (!looksLikeComfyGraph) {
-        const auto* topNodes = nodesObj->find("nodes");
-        if (topNodes && topNodes->type == SimpleJson::JsonType::Array) {
-            for (const auto& item : topNodes->arrVal) {
-                if (item && item->type == SimpleJson::JsonType::Object && !item->getStr("type").empty()) {
-                    looksLikeComfyGraph = true;
-                    break;
-                }
-            }
-        }
-    }
-    if (!looksLikeComfyGraph) return false;
-
-    info.has_metadata = true;
-    info.generator = L"ComfyUI";
 
     std::string widthHeight;
     std::vector<std::string> loras;
@@ -1802,6 +2039,7 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         std::string classType = node->getStr("class_type");
         const auto* inputs = node->getObj("inputs");
         if (!inputs) continue;
+        if (!classType.empty()) looksLikeComfyGraph = true;
 
         // Flux/SD3-style "custom sampler" graphs split a single KSampler into
         // several single-purpose nodes wired together via links --
@@ -1809,9 +2047,16 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         // KSamplerSelect (sampler name), and a scheduler node (steps/denoise,
         // e.g. BasicScheduler/Flux2Scheduler) -- so route all of them through
         // this same key-presence-driven block rather than just literal
-        // "KSampler"/"...Sampler" node types.
+        // "KSampler"/"...Sampler" node types. "UltimateSDUpscale" (the
+        // ssitu/ComfyUI_UltimateSDUpscale node) is the same shape but its
+        // class_type name contains neither "Sampler" nor "Scheduler" --
+        // listed explicitly since it's an extremely common upscale-with-
+        // resample node carrying its own seed/steps/cfg/sampler_name/
+        // scheduler/denoise/positive/negative fields, and a workflow that
+        // uses it for the whole generation (no separate KSampler node at
+        // all) would otherwise leave every one of those fields empty.
         if (classType == "KSampler" || classType == "KSamplerAdvanced" || classType == "KSamplerSelect" ||
-            classType == "CFGGuider" || classType == "RandomNoise" ||
+            classType == "CFGGuider" || classType == "RandomNoise" || classType == "UltimateSDUpscale" ||
             classType.find("Sampler") != std::string::npos || classType.find("Scheduler") != std::string::npos) {
             // seed/steps/cfg/denoise are usually literal numbers, but some
             // graphs route them through a separate helper node (e.g. a
@@ -1854,12 +2099,40 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                 if (const auto* v = inputs->find("negative")) negativeNodeId = GetLinkNodeId(v);
             }
         }
+        // Efficiency-Nodes' "Efficient Loader" carries the positive/negative
+        // CLIPTextEncode-equivalent links directly on the LOADER node, not
+        // the sampler -- "KSampler (Efficient)"/"Ultimate SD Upscale (Efficient)"
+        // instead take a single bundled "context" pipe input with no
+        // separate positive/negative fields at all, so the KSampler-family
+        // gate above never captures them for this pack.
+        else if (classType.find("Efficient Loader") != std::string::npos) {
+            if (positiveNodeId.empty()) {
+                if (const auto* v = inputs->find("positive")) positiveNodeId = GetLinkNodeId(v);
+            }
+            if (negativeNodeId.empty()) {
+                if (const auto* v = inputs->find("negative")) negativeNodeId = GetLinkNodeId(v);
+            }
+        }
 
         if (classType == "CLIPTextEncode" || classType == "BNK_CLIPTextEncodeAdvanced" ||
             classType.find("Prompt") != std::string::npos || classType.find("TextEncode") != std::string::npos) {
-            if (const auto* textField = inputs->find("text")) {
+            if (classType == "PromptToolkit_ShowText" && !inputs->getStr("displayed_text").empty()) {
+                // A "Prompt Toolkit" display/debug node whose own "text"
+                // input is a link back into the encoder node that produced
+                // it ([node_id, output_slot]) -- ResolveTextField/GetLinkNodeId
+                // only address a link by node id, not output slot, so
+                // following it re-enters the encoder node and finds none of
+                // its own "text"/"value" fields (it only has a "template"/
+                // "pools" wildcard-pool DSL, no plain literal). The node's
+                // own "displayed_text" widget already holds the fully
+                // wildcard-expanded text actually used for this generation --
+                // prefer it outright rather than chasing the unreliable link.
+                std::string text = inputs->getStr("displayed_text");
+                if (ui.posPromptText.empty()) ui.posPromptText = text;
+                else if (ui.negPromptText.empty()) ui.negPromptText = text;
+            } else if (const auto* textField = inputs->find("text")) {
                 std::string text = ResolveTextField(nodesObj, textField);
-                if (!text.empty()) {
+                if (!text.empty() && !LooksLikeSerializedTextBlob(text)) {
                     if (ui.posPromptText.empty()) ui.posPromptText = text;
                     else if (ui.negPromptText.empty()) ui.negPromptText = text;
                 }
@@ -1890,19 +2163,43 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         // stock class_type strings, so match on substring like the
         // "Sampler"/"Scheduler" routing above rather than an exact list.
         // Case-insensitive because GGUF-quantized loader variants (e.g.
-        // "UnetLoaderGGUF") don't preserve the stock "UNETLoader" casing.
+        // "UnetLoaderGGUF") don't preserve the stock "UNETLoader" casing;
+        // matching "GGUF" on its own additionally covers reversed-order
+        // naming like "LoaderGGUF" that doesn't contain "UNETLoader" as a
+        // substring at all. ckpt_name/unet_name/model_name/gguf_name go
+        // through ResolveTextField, not a plain getStr(): some graphs route
+        // the literal through a helper node (e.g. a "Checkpoint Selector"
+        // reusing "ckpt_name" for its own literal, the same indirection
+        // "Sampler Selector"/"Scheduler Selector" already need above) via a
+        // link array instead of embedding it directly -- getStr() on a link
+        // array silently returns "".
         if (classType == "Load Checkpoint" || ContainsCI(classType, "CheckpointLoader") ||
-            ContainsCI(classType, "DiffusionModelLoader") || ContainsCI(classType, "UNETLoader")) {
-            if (inputs->find("ckpt_name")) ui.modelName = inputs->getStr("ckpt_name");
-            else if (inputs->find("unet_name")) ui.modelName = inputs->getStr("unet_name");
-            else if (inputs->find("model_name")) ui.modelName = inputs->getStr("model_name");
+            ContainsCI(classType, "DiffusionModelLoader") || ContainsCI(classType, "UNETLoader") ||
+            ContainsCI(classType, "GGUF")) {
+            if (const auto* ckptV = inputs->find("ckpt_name")) ui.modelName = ResolveTextField(nodesObj, ckptV, "ckpt_name");
+            else if (const auto* unetV = inputs->find("unet_name")) ui.modelName = ResolveTextField(nodesObj, unetV, "unet_name");
+            else if (const auto* modelV = inputs->find("model_name")) ui.modelName = ResolveTextField(nodesObj, modelV, "model_name");
+            else if (const auto* ggufV = inputs->find("gguf_name")) ui.modelName = ResolveTextField(nodesObj, ggufV, "gguf_name");
         }
 
-        if (classType == "VAELoader" && inputs->find("vae_name")) {
-            ui.vaeName = inputs->getStr("vae_name");
+        if (classType == "VAELoader") {
+            if (const auto* v = inputs->find("vae_name")) ui.vaeName = ResolveTextField(nodesObj, v, "vae_name");
+        } else if (classType.find("Efficient Loader") != std::string::npos && ui.vaeName.empty()) {
+            // Efficiency-Nodes' "Efficient Loader" bundles its own real
+            // "vae_name" literal (unlike its "ckpt_name", which in real
+            // files can hold a cosmetic placeholder string when the
+            // checkpoint is actually routed in externally via a separate
+            // "Ext Model Input" node -- not trustworthy enough to read here,
+            // so only VAE is captured from this node, as a fallback behind a
+            // real dedicated VAELoader).
+            if (const auto* v = inputs->find("vae_name")) ui.vaeName = ResolveTextField(nodesObj, v, "vae_name");
         }
 
-        bool classTypeHasLora = classType.find("Lora") != std::string::npos;
+        // Case-insensitive for the same reason as the checkpoint/sampler/
+        // scheduler matching above: custom node packs rename the class_type
+        // freely (e.g. "XEN0_LoRA_Styler") and can't be relied on for exact
+        // casing of "Lora".
+        bool classTypeHasLora = ContainsCI(classType, "Lora");
 
         // LoraTagLoader has no "lora_name"/slot fields at all -- it reads its
         // LoRA list out of A1111-style "<lora:name:weight>" tags embedded in
@@ -1930,17 +2227,73 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             // other optional field's "missing means default" convention
             // used elsewhere in this decoder.
             for (const auto& kv : inputs->objVal) {
-                if (kv.first.rfind("lora_", 0) != 0 || !kv.second || kv.second->type != JsonType::Object) continue;
-                const auto& slot = *kv.second;
-                const JsonValue* onField = slot.find("on");
-                if (onField && onField->type == JsonType::Bool && !onField->boolVal) continue;
-                std::string name = slot.getStr("lora");
-                if (name.empty()) continue;
-                loras.push_back(name + ": " + FormatCompactNumber(slot.getNum("strength")));
+                if (kv.first.rfind("lora_", 0) != 0 || !kv.second) continue;
+                if (kv.second->type == JsonType::Object) {
+                    const auto& slot = *kv.second;
+                    const JsonValue* onField = slot.find("on");
+                    if (onField && onField->type == JsonType::Bool && !onField->boolVal) continue;
+                    std::string name = slot.getStr("lora");
+                    if (name.empty()) continue;
+                    loras.push_back(name + ": " + FormatCompactNumber(slot.getNum("strength")));
+                } else if (kv.second->type == JsonType::String && kv.first.rfind("lora_name_", 0) == 0) {
+                    // Efficiency-Nodes' "LoRA Stacker" uses "lora_name_N" +
+                    // sibling "lora_wt_N"/"model_str_N"/"clip_str_N" fields --
+                    // "lora_wt_N" is the single combined weight shown in the
+                    // node's "simple" input_mode UI (model_str_N/clip_str_N
+                    // can diverge from it in "advanced" mode, but there's no
+                    // single "the" weight in that case either way, so this
+                    // still shows the most representative number). Checked
+                    // before the plain "lora_N" shape below: "lora_name_N" is
+                    // also caught by that branch's looser prefix check, but
+                    // its wrongly-derived suffix ("name_N") never matches any
+                    // real "strength_name_N" field, silently defaulting every
+                    // entry's weight to 1.0 regardless of the real value.
+                    const std::string& name = kv.second->strVal;
+                    if (name.empty() || name == "None") continue;
+                    std::string suffix = kv.first.substr(10); // after "lora_name_"
+                    const auto* weightField = inputs->find("lora_wt_" + suffix);
+                    double strength = (weightField && weightField->type == JsonType::Number) ? weightField->numVal : 1.0;
+                    loras.push_back(name + ": " + FormatCompactNumber(strength));
+                } else if (kv.second->type == JsonType::String && kv.first.rfind("lora_", 0) == 0) {
+                    // Other multi-slot loaders (e.g. patientx/ComfyUI-INT8-Fast-
+                    // ROCM's "INT8GroupedLora") use flat "lora_N"/"strength_N"
+                    // sibling fields instead of a per-slot object, with "None"
+                    // as the "slot unused" sentinel rather than omitting the
+                    // field or an "on": false flag.
+                    const std::string& name = kv.second->strVal;
+                    if (name.empty() || name == "None") continue;
+                    std::string suffix = kv.first.substr(5); // after "lora_"
+                    const auto* strengthField = inputs->find("strength_" + suffix);
+                    double strength = (strengthField && strengthField->type == JsonType::Number) ? strengthField->numVal : 1.0;
+                    loras.push_back(name + ": " + FormatCompactNumber(strength));
+                }
+            }
+        } else if (classType == "PromptToolkit_SuperEncode") {
+            // A "Prompt Toolkit" node bundling its own numbered LoRA slots
+            // (lora_N/use_lora_N/strength_N) directly onto the prompt-encode
+            // node itself rather than a dedicated loader node whose
+            // class_type would contain "Lora" -- ContainsCI(classType,
+            // "Lora") never matches this node at all, so its LoRAs were
+            // previously invisible outright. Unlike every other multi-slot
+            // shape handled above, every field here (including the enabled
+            // flag and the strength) is serialized as a STRING, not a real
+            // JSON bool/number.
+            for (const auto& kv : inputs->objVal) {
+                if (kv.first.rfind("lora_", 0) != 0 || kv.first.rfind("lora_name", 0) == 0) continue;
+                if (!kv.second || kv.second->type != JsonType::String) continue;
+                const std::string& name = kv.second->strVal;
+                if (name.empty() || name == "None") continue;
+                std::string suffix = kv.first.substr(5); // after "lora_"
+                const auto* useField = inputs->find("use_lora_" + suffix);
+                if (useField && useField->type == JsonType::String && useField->strVal == "false") continue;
+                const auto* strengthField = inputs->find("strength_" + suffix);
+                std::string strengthStr = (strengthField && strengthField->type == JsonType::String) ? strengthField->strVal : "1";
+                loras.push_back(name + ": " + strengthStr);
             }
         }
 
-        if (classType == "EmptyLatentImage" || classType == "EmptySD3LatentImage" || classType.find("LatentImage") != std::string::npos) {
+        if (classType == "EmptyLatentImage" || classType == "EmptySD3LatentImage" ||
+            classType.find("LatentImage") != std::string::npos || classType.find("Latent Image") != std::string::npos) {
             const auto* widthField = inputs->find("width");
             const auto* heightField = inputs->find("height");
             if (widthField && heightField) {
@@ -1950,9 +2303,44 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                 std::string wStr = ResolveTextField(nodesObj, widthField);
                 std::string hStr = ResolveTextField(nodesObj, heightField);
                 if (!wStr.empty() && !hStr.empty()) widthHeight = wStr + "x" + hStr;
+            } else if (const auto* dimField = inputs->find("dimensions")) {
+                // rgthree's "SDXL Empty Latent Image" packs width/height into
+                // one free-form "dimensions" widget string instead of
+                // separate numeric fields, e.g. " 832 x 1216  (portrait)".
+                std::string dims = ResolveTextField(nodesObj, dimField);
+                size_t wStart = dims.find_first_of("0123456789");
+                if (wStart != std::string::npos) {
+                    size_t wEnd = dims.find_first_not_of("0123456789", wStart);
+                    std::string wStr = dims.substr(wStart, wEnd - wStart);
+                    size_t xPos = dims.find('x', wEnd);
+                    if (xPos != std::string::npos) {
+                        size_t hStart = dims.find_first_of("0123456789", xPos);
+                        if (hStart != std::string::npos) {
+                            size_t hEnd = dims.find_first_not_of("0123456789", hStart);
+                            std::string hStr = dims.substr(hStart, hEnd - hStart);
+                            if (!wStr.empty() && !hStr.empty()) widthHeight = wStr + "x" + hStr;
+                        }
+                    }
+                }
             }
         }
     }
+
+    if (!looksLikeComfyGraph) {
+        const auto* topNodesCheck = nodesObj->find("nodes");
+        if (topNodesCheck && topNodesCheck->type == SimpleJson::JsonType::Array) {
+            for (const auto& item : topNodesCheck->arrVal) {
+                if (item && item->type == SimpleJson::JsonType::Object && !item->getStr("type").empty()) {
+                    looksLikeComfyGraph = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!looksLikeComfyGraph) return false;
+
+    info.has_metadata = true;
+    info.generator = L"ComfyUI";
 
     // Prefer resolving the exact positive/negative CLIPTextEncode nodes wired
     // into the KSampler's "positive"/"negative" inputs over the "first/second
@@ -2252,14 +2640,128 @@ bool AImgDecoder::DecodeSimpleGraphGenerator(const SimpleJson::JsonValue* root, 
 }
 
 bool AImgDecoder::DecodeInvokeAI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
-    // "positive_prompt"/"negative_prompt" naming is distinctly InvokeAI;
-    // without this gate any JSON object (including SwarmUI/NovelAI's own
-    // metadata) would match here, since this decoder runs before them.
+    // Gate on "positive_prompt" alone (not OR'd with "negative_prompt" as
+    // before): real InvokeAI invokeai_metadata always sets positive_prompt,
+    // even when empty, while several unrelated tools (WanGP among them) also
+    // happen to carry a bare "negative_prompt" key that would otherwise
+    // satisfy a looser gate and mislabel the generator.
     static const SimpleGeneratorConfig cfg = {
-        "positive_prompt", "negative_prompt", L"InvokeAI",
+        "positive_prompt", "", L"InvokeAI",
         "positive_prompt", "prompt", "negative_prompt", "model", "cfg_scale", "scheduler"
     };
-    return DecodeSimpleGraphGenerator(root, originalText, info, &cfg);
+    if (!DecodeSimpleGraphGenerator(root, originalText, info, &cfg)) return false;
+
+    // The shared helper only reads flat string keys via getStr(), but real
+    // InvokeAI metadata nests model/vae as objects ({"name":...,"hash":...})
+    // and LoRAs as an array -- pick those up here so Model/Model Hash/VAE/
+    // LoRA/Size aren't silently left empty despite the data being present.
+    if (const auto* modelObj = root->getObj("model")) {
+        std::string name = modelObj->getStr("name");
+        if (!name.empty()) info.model = Utf8ToWstring(name);
+        std::string hash = modelObj->getStr("hash");
+        static const std::string kBlake3Prefix = "blake3:";
+        if (hash.compare(0, kBlake3Prefix.size(), kBlake3Prefix) == 0) hash.erase(0, kBlake3Prefix.size());
+        if (!hash.empty()) info.model_hash = Utf8ToWstring(hash);
+    }
+    if (const auto* vaeObj = root->getObj("vae")) {
+        std::string name = vaeObj->getStr("name");
+        if (!name.empty()) info.vae = Utf8ToWstring(name);
+    }
+    info.size = MakeSizeString(root->getInt64("width"), root->getInt64("height"));
+
+    const auto* lorasField = root->find("loras");
+    if (lorasField && lorasField->type == SimpleJson::JsonType::Array) {
+        std::string joined;
+        for (const auto& item : lorasField->arrVal) {
+            if (!item || item->type != SimpleJson::JsonType::Object) continue;
+            const auto* loraModel = item->getObj("model");
+            std::string name = loraModel ? loraModel->getStr("name") : "";
+            if (name.empty()) continue;
+            if (!joined.empty()) joined += ", ";
+            joined += name + ": " + FormatCompactNumber(item->getNum("weight"));
+        }
+        if (!joined.empty()) info.lora = Utf8ToWstring(joined);
+    }
+
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// WanGP Decoder
+// ---------------------------------------------------------------------------
+
+bool AImgDecoder::DecodeWanGP(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
+    // "activated_loras"/"loras_multipliers" is distinctly WanGP's own
+    // vocabulary -- no other supported generator's JSON uses these keys.
+    // Must run before InvokeAI: WanGP's JSON also carries a bare (usually
+    // empty) "negative_prompt" key, the same false-positive class Easy
+    // Diffusion is guarded against above.
+    if (!root || root->type != SimpleJson::JsonType::Object) return false;
+    if (!root->objVal.count("activated_loras")) return false;
+
+    info.has_metadata = true;
+    info.generator = L"WanGP";
+    info.prompt = Utf8ToWstring(root->getStr("prompt"));
+    info.negative_prompt = Utf8ToWstring(root->getStr("negative_prompt"));
+
+    if (const auto* v = root->find("seed")) {
+        info.seed = v->getInt64();
+        info.has_seed = true;
+    }
+    if (const auto* v = root->find("num_inference_steps")) {
+        info.steps = (int32_t)v->getInt64();
+        info.has_steps = true;
+    }
+
+    info.size = Utf8ToWstring(root->getStr("resolution"));
+
+    // model_filename is a full URL/path to the checkpoint; take the last
+    // path segment as the display name, falling back to the short
+    // model_type code (e.g. "krea2_turbo") if model_filename is absent.
+    std::string modelFile = root->getStr("model_filename");
+    if (!modelFile.empty()) {
+        size_t slash = modelFile.find_last_of('/');
+        std::string baseName = (slash == std::string::npos) ? modelFile : modelFile.substr(slash + 1);
+        info.model = StripModelExtension(Utf8ToWstring(baseName));
+    } else {
+        info.model = Utf8ToWstring(root->getStr("model_type"));
+    }
+
+    // "activated_loras" is an array of "Folder/Name.safetensors" paths;
+    // "loras_multipliers" is a parallel whitespace-separated weight list.
+    // NormalizeLoraField only strips extensions, not directory prefixes, so
+    // strip the folder part here before joining.
+    const auto* lorasField = root->find("activated_loras");
+    if (lorasField && lorasField->type == SimpleJson::JsonType::Array) {
+        std::vector<std::string> weights;
+        {
+            std::string multipliers = root->getStr("loras_multipliers");
+            size_t pos = 0;
+            while (pos < multipliers.size()) {
+                while (pos < multipliers.size() && isspace((unsigned char)multipliers[pos])) pos++;
+                size_t start = pos;
+                while (pos < multipliers.size() && !isspace((unsigned char)multipliers[pos])) pos++;
+                if (pos > start) weights.push_back(multipliers.substr(start, pos - start));
+            }
+        }
+        std::string joined;
+        for (size_t i = 0; i < lorasField->arrVal.size(); i++) {
+            const auto& item = lorasField->arrVal[i];
+            if (!item || item->type != SimpleJson::JsonType::String) continue;
+            std::string path = item->strVal;
+            size_t slash = path.find_last_of('/');
+            std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+            if (name.empty()) continue;
+            if (!joined.empty()) joined += ", ";
+            joined += name;
+            if (i < weights.size()) joined += ": " + weights[i];
+        }
+        if (!joined.empty()) info.lora = Utf8ToWstring(joined);
+    }
+
+    info.full_parameters = Utf8ToWstring(originalText);
+    return true;
 }
 
 

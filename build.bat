@@ -27,7 +27,7 @@ if %errorlevel%==0 (
         echo [ERROR] Resource compile failed.
         exit /b 1
     )
-    cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fe:build\aimg.wdx64 /link /DEF:src\aimg.def build\aimg.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+    cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fe:build\aimg.wdx64 /link /DEF:src\aimg.def build\aimg.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
     if errorlevel 1 (
         echo [ERROR] MSVC build failed.
         exit /b 1
@@ -44,7 +44,7 @@ if %errorlevel%==0 (
         echo [ERROR] Resource compile failed.
         exit /b 1
     )
-    g++ -O3 -flto -fno-rtti -ffunction-sections -fdata-sections -shared -I src src/metadata_parser.cpp src/aimg_decoder.cpp src/aimg.cpp src/aimg.def build/aimg.res.o -o build/aimg.wdx64 -static -Wl,--gc-sections
+    g++ -O3 -flto -fno-rtti -ffunction-sections -fdata-sections -DUNICODE -D_UNICODE -shared -I src src/metadata_parser.cpp src/aimg_decoder.cpp src/aimg.cpp src/aimg.def build/aimg.res.o -o build/aimg.wdx64 -static -Wl,--gc-sections
     if errorlevel 1 (
         echo [ERROR] GCC build failed.
         exit /b 1

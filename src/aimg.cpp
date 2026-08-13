@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <deque>
-#include <unordered_map>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Caching Mechanism for High-Speed Total Commander File Scanning
@@ -47,7 +47,12 @@ struct CacheEntry {
         int fieldIndex = -1;
         size_t offset = 0;
     };
-    std::unordered_map<uint64_t /*threadId*/, FulltextCursor> fulltextCursors;
+    // Realistically holds 0-1 live entries at a time (single-pane TC usage is
+    // one thread; even multi-pane rarely has more than a couple of threads
+    // mid-continuation simultaneously), so a linear-scan vector avoids
+    // unordered_map's bucket-array allocation for what's almost always a
+    // 0-1-element lookup.
+    std::vector<std::pair<uint64_t /*threadId*/, FulltextCursor>> fulltextCursors;
 };
 
 static const size_t kCacheCapacity = 4;
@@ -162,10 +167,17 @@ static void EnsureCached(const std::wstring& filePath) {
 static int WriteFulltextChunk(CacheEntry& entry, int fieldIndex, const std::wstring& text, void* FieldValue, int maxlen) {
     uint64_t threadId = GetCurrentThreadId();
 
+    auto it = std::find_if(entry.fulltextCursors.begin(), entry.fulltextCursors.end(),
+        [threadId](const std::pair<uint64_t, CacheEntry::FulltextCursor>& p) { return p.first == threadId; });
+    if (it == entry.fulltextCursors.end()) {
+        entry.fulltextCursors.emplace_back(threadId, CacheEntry::FulltextCursor{});
+        it = std::prev(entry.fulltextCursors.end());
+    }
+
     // A stored cursor for a *different* field means that prior continuation
     // sequence was abandoned mid-string (TC stopped calling before reaching
     // the end); starting fresh for this field is correct either way.
-    CacheEntry::FulltextCursor& cursor = entry.fulltextCursors[threadId];
+    CacheEntry::FulltextCursor& cursor = it->second;
     if (cursor.fieldIndex != fieldIndex) {
         cursor.fieldIndex = fieldIndex;
         cursor.offset = 0;
@@ -181,7 +193,7 @@ static int WriteFulltextChunk(CacheEntry& entry, int fieldIndex, const std::wstr
     cursor.offset += toCopy;
 
     if (cursor.offset >= text.size()) {
-        entry.fulltextCursors.erase(threadId); // done; next query for any field starts fresh
+        entry.fulltextCursors.erase(it); // done; next query for any field starts fresh
         return ft_stringw;
     }
     return ft_fulltextw;

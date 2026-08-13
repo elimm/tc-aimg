@@ -18,12 +18,14 @@ Tested against **Automatic1111 WebUI**, **Easy Diffusion**, and **ComfyUI** (Com
   - **AVIF (`.avif`)**: Parses ISOBMFF `Exif` and `xml ` metadata boxes.
   - **TIFF (`.tif`, `.tiff`)**: Parses standard EXIF tags.
 - **Deep Generator Recognition**:
-  - **Automatic1111** (also covers **SD.Next** / **WebUI Forge**'s compatible parameter format) and **Easy Diffusion**: Extracts Positive Prompt, Negative Prompt, Steps, Sampler, Scheduler, CFG Scale, Seed, Model, Model Hash, Clip Skip, Denoising Strength, Hires Upscale parameters, VAE, and LoRA list.
-  - **ComfyUI** *(best-effort)*: Parses execution graphs (`prompt`) and workflow JSON structure. Recursively traces KSampler nodes, CLIPTextEncode nodes, Checkpoint loaders, VAE loaders, LoRA loaders, and latent resolutions.
+  - **Automatic1111** (also covers **SD.Next** / **WebUI Forge**'s compatible parameter format, with Forge itself detected and labeled separately by version string) and **Easy Diffusion**: Extracts Positive Prompt, Negative Prompt, Steps, Sampler, Scheduler, CFG Scale, Seed, Model, Model Hash, Clip Skip, Denoising Strength, Hires Upscale parameters, VAE, and LoRA list.
+  - **ComfyUI** *(best-effort)*: Parses execution graphs (`prompt`) and workflow JSON structure, including subgraphs with promoted widgets. Recursively traces KSampler nodes, CLIPTextEncode nodes, Checkpoint loaders, VAE loaders, LoRA loaders, and latent resolutions, with substring-based matching so many custom node packs are picked up too.
   - **Fooocus** *(untested)*: Extracts Fooocus prompt expansions, styles, samplers, base models, and refiners.
   - **InvokeAI** *(untested)*: Extracts `invokeai_metadata` / `sd_metadata`.
   - **SwarmUI** *(untested)*: Extracts `sui_image_params`.
   - **NovelAI** *(untested)*: Extracts NovelAI Diffusion parameters and seeds.
+  - **Draw Things** *(untested)*: Extracts its XMP-embedded generation record (prompt, seed, sampler, LoRAs, and more).
+  - **WanGP** *(untested)*: Extracts its EXIF-embedded generation record (prompt, seed, LoRAs, and more).
 - **Fast Performance & Thread-Safe Caching**:
   - Zero-lag file list scrolling in Total Commander due to built-in single-pass file result caching.
 - **Full Unicode (UTF-16) Support**:

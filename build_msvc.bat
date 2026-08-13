@@ -38,12 +38,12 @@ if %errorlevel% neq 0 (
     echo Error compiling resource!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 64-bit /MT plugin!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 64-bit /MD plugin!
     exit /b %errorlevel%
@@ -62,12 +62,12 @@ if %errorlevel% neq 0 (
     echo Error compiling resource!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 32-bit /MT plugin!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 32-bit /MD plugin!
     exit /b %errorlevel%

@@ -37,8 +37,7 @@ else()
     # alongside its own runtime, so it must not depend on libgcc/libstdc++/
     # libwinpthread being present on the target machine.
     # -flto/-fno-rtti/-ffunction-sections+-fdata-sections+--gc-sections are the
-    # GCC/Clang equivalents of the MSVC flags above; -s strips symbols (smaller
-    # DLL, matching /GL+/OPT:REF,ICF's size-reduction goal on the MSVC side).
+    # GCC/Clang equivalents of the MSVC flags above.
     target_compile_options(aimg PRIVATE -Wall -O3 -flto -fno-rtti -ffunction-sections -fdata-sections -DUNICODE -D_UNICODE)
     target_link_options(aimg PRIVATE -static -flto -s -Wl,--gc-sections)
 endif()

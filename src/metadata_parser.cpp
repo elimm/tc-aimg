@@ -391,13 +391,28 @@ static void StorePngText(RawImageMetadata& outMetadata, const std::string& key,
     }
 }
 
+// Packs a 4-byte chunk type tag into a single uint32_t so every chunk header
+// (including the routinely-skipped ones, e.g. IDAT) can be dispatched with
+// one integer comparison instead of building a std::string and running
+// several 4-char string compares against it -- this runs on every chunk in
+// the file, not just the text-ish ones.
+static constexpr uint32_t PackChunkType(char a, char b, char c, char d) {
+    return ((uint32_t)(uint8_t)a << 24) | ((uint32_t)(uint8_t)b << 16) | ((uint32_t)(uint8_t)c << 8) | (uint32_t)(uint8_t)d;
+}
+
 bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata) {
     uint64_t pos = 8; // caller has already positioned `file` here, right after the signature
 
+    static const uint32_t kIEND = PackChunkType('I', 'E', 'N', 'D');
+    static const uint32_t kTEXt = PackChunkType('t', 'E', 'X', 't');
+    static const uint32_t kZTXt = PackChunkType('z', 'T', 'X', 't');
+    static const uint32_t kITXt = PackChunkType('i', 'T', 'X', 't');
+    static const uint32_t kEXIf = PackChunkType('e', 'X', 'I', 'f');
+
     // Every chunk except these (above all IDAT, the pixel data -- routinely
     // most of an AI render's file size) is skipped via seekg() unread.
-    auto isTextish = [](const std::string& t) {
-        return t == "tEXt" || t == "zTXt" || t == "iTXt" || t == "eXIf";
+    auto isTextish = [](uint32_t t) {
+        return t == kTEXt || t == kZTXt || t == kITXt || t == kEXIf;
     };
 
     // Guards against a crafted chunk claiming an implausibly large length
@@ -412,12 +427,12 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
         if ((uint64_t)file.gcount() != 8) break;
 
         uint32_t length = ReadU32BE(header);
-        std::string chunkType((const char*)header + 4, 4);
+        uint32_t chunkType = ReadU32BE(header + 4);
         pos += 8;
 
         if (pos + (uint64_t)length + 4 > fileSize) break; // chunk claims more than remains in the file
 
-        if (chunkType == "IEND") break;
+        if (chunkType == kIEND) break;
 
         if (isTextish(chunkType) && length <= kMaxTextChunkPayload) {
             std::vector<uint8_t> chunkData(length);
@@ -427,14 +442,14 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
             }
             const uint8_t* data = chunkData.data();
 
-            if (chunkType == "tEXt") {
+            if (chunkType == kTEXt) {
                 const uint8_t* nullPos = (const uint8_t*)memchr(data, 0, length);
                 if (nullPos) {
                     std::string key((const char*)data, nullPos - data);
                     std::string text((const char*)nullPos + 1, length - (nullPos - data + 1));
                     outMetadata.text_chunks[key] = text;
                 }
-            } else if (chunkType == "zTXt") {
+            } else if (chunkType == kZTXt) {
                 const uint8_t* nullPos = (const uint8_t*)memchr(data, 0, length);
                 if (nullPos && (nullPos + 1 < data + length)) {
                     std::string key((const char*)data, nullPos - data);
@@ -446,7 +461,7 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
                         StorePngText(outMetadata, key, compData, compLen, /*compressed=*/true);
                     }
                 }
-            } else if (chunkType == "iTXt") {
+            } else if (chunkType == kITXt) {
                 const uint8_t* nullPos = (const uint8_t*)memchr(data, 0, length);
                 if (nullPos && (nullPos + 2 < data + length)) {
                     std::string key((const char*)data, nullPos - data);
@@ -482,7 +497,7 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
                         }
                     }
                 }
-            } else if (chunkType == "eXIf") {
+            } else if (chunkType == kEXIf) {
                 ParseEXIF(data, length, outMetadata);
             }
 
@@ -694,9 +709,7 @@ bool MetadataParser::ParseEXIF(const uint8_t* data, size_t size, RawImageMetadat
             if (byteLen > 4 && valOrOff + byteLen > (uint64_t)tiffSize) continue;
             const uint8_t* valPtr = (byteLen <= 4) ? (tiffData + p + 8) : (tiffData + valOrOff);
 
-            if (tag == 0x010e) { // ImageDescription
-                outMetadata.text_chunks["exif:ImageDescription"] = std::string((const char*)valPtr, cnt);
-            } else if (tag == 0x8769) { // ExifIFDPointer
+            if (tag == 0x8769) { // ExifIFDPointer
                 exifIFDOffset = valOrOff;
             } else if (tag == 0x9286) { // UserComment
                 if (cnt >= 8) {
@@ -711,12 +724,21 @@ bool MetadataParser::ParseEXIF(const uint8_t* data, size_t size, RawImageMetadat
                 } else {
                     outMetadata.text_chunks["exif:UserComment"] = std::string((const char*)valPtr, cnt);
                 }
-            } else if (tag == 0x927C) {
-                outMetadata.text_chunks["exif:MakerNote"] = std::string((const char*)valPtr, cnt);
-            } else if (tag == 0x013B) {
-                outMetadata.text_chunks["exif:Artist"] = std::string((const char*)valPtr, cnt);
-            } else if (tag == 0x013C) {
-                outMetadata.text_chunks["exif:Software"] = std::string((const char*)valPtr, cnt);
+            } else {
+                // ImageDescription/MakerNote/Artist/Software: plain raw-text tags,
+                // all stored the same way -- table lookup instead of one branch each.
+                static const struct { uint16_t tag; const char* key; } kPlainTextTags[] = {
+                    {0x010e, "exif:ImageDescription"},
+                    {0x927C, "exif:MakerNote"},
+                    {0x013B, "exif:Artist"},
+                    {0x013C, "exif:Software"},
+                };
+                for (const auto& e : kPlainTextTags) {
+                    if (tag == e.tag) {
+                        outMetadata.text_chunks[e.key] = std::string((const char*)valPtr, cnt);
+                        break;
+                    }
+                }
             }
         }
     };

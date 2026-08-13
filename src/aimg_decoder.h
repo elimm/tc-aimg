@@ -31,6 +31,10 @@ private:
     // it has extra fields (a lora[] array, denoising "strength", nested
     // v2.clipSkip) with no equivalent in that shared shape.
     static bool DecodeDrawThings(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
+    // Custom, not folded into SimpleGeneratorConfig -- LoRA needs to be
+    // zipped from two parallel arrays (activated_loras / loras_multipliers),
+    // which the shared flat-key helper can't do.
+    static bool DecodeWanGP(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
     // Shared implementation for InvokeAI/SwarmUI/NovelAI (see definition site
     // in aimg_decoder.cpp for why Easy Diffusion isn't folded in too). cfgVoid
     // is a `const SimpleGeneratorConfig*` -- that type is file-local to
