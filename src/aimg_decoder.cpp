@@ -1041,6 +1041,25 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
         }
         return "";
     }
+    if (classType == "RegexReplace") {
+        // A regex find/replace utility node (e.g. comfyui-custom-scripts'
+        // "Replace Text (Regex)") commonly sits between a prompt's real
+        // source and the CLIPTextEncode that consumes it -- trimming a
+        // trailing separator character left over from an upstream
+        // concatenation, say. Its literal-carrying input is named "string",
+        // not the generic "text"/"value" the stock fallback below checks, so
+        // without this branch the whole chain silently resolves to "" here --
+        // which previously let the *other* branch's (unrelated) text get
+        // mistakenly attributed to this one by the caller's encounter-order
+        // fallback. The regex substitution itself isn't applied -- passing
+        // through the pre-replace text is a cosmetic approximation (e.g. an
+        // untrimmed leading/trailing comma) that's still far more useful than
+        // an empty/wrong result.
+        if (const JsonValue* v = refInputs->find("string")) {
+            return ResolveTextField(nodesObj, v, preferredKey, depth + 1);
+        }
+        return "";
+    }
     if (classType == "Flux_Finish_StylesStyler") {
         // A custom Flux prompt/style-preset node whose CONDITIONING output is
         // fed by a "text_positive"/"text_negative" pair rather than the
@@ -1572,6 +1591,17 @@ std::string ResolveNodeTextByType(const JsonValue* node, const std::string& scop
         return "";
     }
 
+    if (typeStr == "RegexReplace") {
+        // Same rationale as the API-format branch in ResolveTextField: the
+        // node's literal-carrying input is named "string", not "source"/
+        // "value" -- pass the pre-replace text through unmodified.
+        int64_t srcLink;
+        if (GetNodeInputLink(node, "string", srcLink)) {
+            return ResolveUiTextThroughLink(scopeId, srcLink, index, registry, depth + 1);
+        }
+        return "";
+    }
+
     if (typeStr == "Flux_Finish_StylesStyler") {
         std::string positive = NamedWidgetString(node, "text_positive");
         if (!positive.empty()) return positive;
@@ -1646,7 +1676,7 @@ std::string ResolveNodeTextByType(const JsonValue* node, const std::string& scop
 // toggle widget instead of an honest empty result.
 bool IsKnownPassthroughNodeType(const std::string& typeStr) {
     return typeStr == "ComfySwitchNode" || typeStr == "StringConcatenate" || typeStr == "Text Concatenate" ||
-           typeStr == "Reroute" || typeStr == "PreviewAny";
+           typeStr == "Reroute" || typeStr == "PreviewAny" || typeStr == "RegexReplace";
 }
 
 // Follows a CLIPTextEncode "text" input's link through pass-through/prompt-
@@ -2074,22 +2104,50 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                 double n = ResolveNumberField(nodesObj, v2, foundNum, "noise_seed");
                 if (foundNum) { info.seed = (int64_t)n; info.has_seed = true; }
             }
+            // Some custom "two-stage" samplers (e.g. Krea's KreaTwoStageSampler,
+            // a base pass followed by a fast refine/upscale pass in one node)
+            // expose no plain "steps"/"cfg"/"sampler_name"/"scheduler"/"denoise"
+            // at all -- every one of those is prefixed "stage1_"/"stage2_"
+            // instead, so the lookups above silently find nothing even though
+            // the class_type's "Sampler" substring already matched this node
+            // as sampler-family. Fall back to stage1_* (the base pass -- the
+            // closest single-pass-KSampler analog) for the primary fields, and
+            // separately surface stage2_steps (the refine pass) through the
+            // existing hires_steps field, mirroring how A1111's hires-fix
+            // second pass already maps onto it.
             if (const auto* v = inputs->find("steps")) {
                 double n = ResolveNumberField(nodesObj, v, foundNum, "steps");
                 if (foundNum) { info.steps = (int32_t)n; info.has_steps = true; }
+            } else if (const auto* v1 = inputs->find("stage1_steps")) {
+                double n = ResolveNumberField(nodesObj, v1, foundNum, "stage1_steps");
+                if (foundNum) { info.steps = (int32_t)n; info.has_steps = true; }
+            }
+            if (const auto* v = inputs->find("stage2_steps")) {
+                double n = ResolveNumberField(nodesObj, v, foundNum, "stage2_steps");
+                if (foundNum) { info.hires_steps = (int32_t)n; info.has_hires_steps = true; }
             }
             if (const auto* v = inputs->find("cfg")) {
                 double n = ResolveNumberField(nodesObj, v, foundNum, "cfg");
                 if (foundNum) { info.cfg_scale = n; info.has_cfg = true; }
+            } else if (const auto* v1 = inputs->find("stage1_cfg")) {
+                double n = ResolveNumberField(nodesObj, v1, foundNum, "stage1_cfg");
+                if (foundNum) { info.cfg_scale = n; info.has_cfg = true; }
             }
             if (const auto* v = inputs->find("sampler_name")) {
                 ui.samplerName = ResolveTextField(nodesObj, v, "sampler_name");
+            } else if (const auto* v1 = inputs->find("stage1_sampler_name")) {
+                ui.samplerName = ResolveTextField(nodesObj, v1, "stage1_sampler_name");
             }
             if (const auto* v = inputs->find("scheduler")) {
                 ui.schedulerName = ResolveTextField(nodesObj, v, "scheduler");
+            } else if (const auto* v1 = inputs->find("stage1_scheduler")) {
+                ui.schedulerName = ResolveTextField(nodesObj, v1, "stage1_scheduler");
             }
             if (const auto* v = inputs->find("denoise")) {
                 double n = ResolveNumberField(nodesObj, v, foundNum, "denoise");
+                if (foundNum) { info.denoising_strength = n; info.has_denoising_strength = true; }
+            } else if (const auto* v1 = inputs->find("stage1_denoise")) {
+                double n = ResolveNumberField(nodesObj, v1, foundNum, "stage1_denoise");
                 if (foundNum) { info.denoising_strength = n; info.has_denoising_strength = true; }
             }
             if (positiveNodeId.empty()) {
@@ -2217,6 +2275,43 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         // scheduler routing above rather than an exact list.
         else if (classTypeHasLora && inputs->find("lora_name")) {
             loras.push_back(inputs->getStr("lora_name"));
+        } else if (classTypeHasLora && classType == "Lora Loader (LoraManager)") {
+            // ComfyUI-Lora-Manager's own multi-select loader stores its slots
+            // in a "loras" input shaped {"__value__": [{"name","strength",
+            // "active",...}, ...]} -- none of the "lora_"-prefixed-sibling-
+            // field shapes above ever see it, since the top-level key here is
+            // "loras" (no underscore/number suffix), so its LoRAs were
+            // previously invisible outright. The node's own "text" widget
+            // also carries an A1111-style "<lora:name:weight>" tag for EVERY
+            // entry regardless of "active" (a convenience for pasting into
+            // other tools), so resolving via that text instead would
+            // overcount -- read the structured array and keep only
+            // active:true entries, same "explicit false excludes, anything
+            // else stays" convention as the rgthree Power-Lora-Loader branch
+            // above. "strength" is inconsistently typed within the same real
+            // file (a Number on some entries, a numeric String on others) --
+            // accept either rather than silently reading 0 via getNum() on a
+            // String-typed entry.
+            const JsonValue* valueArr = nullptr;
+            if (const auto* lorasField = inputs->find("loras")) {
+                if (lorasField->type == JsonType::Object) valueArr = lorasField->find("__value__");
+            }
+            if (valueArr && valueArr->type == JsonType::Array) {
+                for (const auto& entry : valueArr->arrVal) {
+                    if (!entry || entry->type != JsonType::Object) continue;
+                    const JsonValue* activeField = entry->find("active");
+                    if (!activeField || activeField->type != JsonType::Bool || !activeField->boolVal) continue;
+                    std::string name = entry->getStr("name");
+                    if (name.empty()) continue;
+                    const JsonValue* strengthField = entry->find("strength");
+                    double strength = 1.0;
+                    if (strengthField) {
+                        if (strengthField->type == JsonType::Number) strength = strengthField->numVal;
+                        else if (strengthField->type == JsonType::String && !strengthField->strVal.empty()) strength = atof(strengthField->strVal.c_str());
+                    }
+                    loras.push_back(name + ": " + FormatCompactNumber(strength));
+                }
+            }
         } else if (classTypeHasLora) {
             // rgthree's "Power Lora Loader" has no single "lora_name" -- it
             // exposes several numbered slots instead, each an object
