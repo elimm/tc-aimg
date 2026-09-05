@@ -4,12 +4,9 @@
 #include <string>
 #include <cstdint>
 
-// Field order groups by type (wstring, then numeric, then bool flags) rather
-// than by logical field pairing -- each bool sitting between two 8-byte-
-// aligned members (std::wstring/int64_t/double) used to force 3-7 bytes of
-// padding after it; grouping all seven flags together at the end leaves only
-// one small padding gap instead of six. All call sites access fields by
-// name, never by offset, so this reorder is layout-only.
+// Grouped by type (strings, then numerics, then bool flags) rather than by
+// logical pairing: an interleaved bool forces 3-7 bytes of padding after
+// each one. Layout-only -- every call site accesses fields by name.
 struct AImgInfo {
     std::wstring generator;          // e.g. "Automatic1111", "ComfyUI", "Fooocus", etc.
     std::wstring prompt;             // Positive Prompt
@@ -23,7 +20,11 @@ struct AImgInfo {
     std::wstring hires_upscaler;     // e.g. "Latent", "4x-UltraSharp"
     std::wstring vae;                // VAE name
     std::wstring lora;               // Used LoRAs list
-    std::wstring full_parameters;    // Raw parameters text / workflow summary
+    // Raw parameters text / workflow, kept as UTF-8 on purpose: for a large
+    // ComfyUI graph this can be ~1 MB, and only the opt-in "Full Parameters"
+    // field ever reads it. aimg.cpp converts to UTF-16 lazily and caches
+    // that on the LRU entry, so files without that column never pay for it.
+    std::string full_parameters_utf8;
 
     int64_t seed = 0;
     double cfg_scale = 0.0;

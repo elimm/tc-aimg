@@ -28,6 +28,10 @@ Tested against **Automatic1111 WebUI**, **Easy Diffusion**, and **ComfyUI** (Com
   - **WanGP** *(untested)*: Extracts its EXIF-embedded generation record (prompt, seed, LoRAs, and more).
 - **Fast Performance & Thread-Safe Caching**:
   - Zero-lag file list scrolling in Total Commander due to built-in single-pass file result caching.
+  - Large or network-hosted images are read on a background thread instead of Total Commander's main
+    thread, so the file list stays responsive while their metadata is extracted; those columns fill in
+    a moment later rather than freezing the window. Small local files are still read immediately, with
+    no added delay. Interrupting a directory listing aborts an extraction already in progress.
 - **Full Unicode (UTF-16) Support**:
   - Correctly displays prompts containing non-Latin scripts (Cyrillic, Japanese, Chinese, etc.) and emojis.
 
@@ -35,12 +39,14 @@ Tested against **Automatic1111 WebUI**, **Easy Diffusion**, and **ComfyUI** (Com
 
 ## 📋 Available Fields in Total Commander
 
+`Prompt`, `Negative Prompt` and `Full Parameters` are full-text search fields (WDX `ft_fulltext`); Total Commander only shows fields of this type in its search dialog (`Alt+F7` -> Plugins tab), not as file-list columns or in the Multi-Rename Tool -- use `Prompt (Short)` / `Negative Prompt (Short)` for a column instead. Field indices changed in 0.2.0 (the three full-text fields moved to the end of the table, as the WDX SDK requires); if you had custom columns configured against the old indices, remove and re-add them in Total Commander's column configuration.
+
 | Field Name | Type | Description |
 |---|---|---|
 | `Generator` | String | Generator name (`Automatic1111`, `ComfyUI`, `Fooocus`, `InvokeAI`, `SwarmUI`, `NovelAI`, etc.) |
-| `Prompt` | Full Text | Positive prompt text, untruncated |
+| `Prompt` | Full Text | Positive prompt text, untruncated (search dialog only, see note above) |
 | `Prompt (Short)` | String | Positive prompt text, cut off at TC's column buffer size (handy for compact columns) |
-| `Negative Prompt` | Full Text | Negative prompt text, untruncated |
+| `Negative Prompt` | Full Text | Negative prompt text, untruncated (search dialog only, see note above) |
 | `Negative Prompt (Short)` | String | Negative prompt text, cut off at TC's column buffer size |
 | `Model` | String | Model / Checkpoint name |
 | `Model Hash` | String | Short model hash (e.g. `7f92a4bc`) |
@@ -60,7 +66,7 @@ Tested against **Automatic1111 WebUI**, **Easy Diffusion**, and **ComfyUI** (Com
 | `VAE` | String | VAE model name |
 | `LoRA` | String | Applied LoRAs and weights |
 | `LoRA Count` | 32-bit Number | Number of LoRAs applied, derived from `LoRA` |
-| `Full Parameters` | Full Text | Complete raw parameters block or JSON workflow |
+| `Full Parameters` | Full Text | Complete raw parameters block or JSON workflow (search dialog only, see note above) |
 | `Has AI Metadata` | Boolean | `Yes` / `No` (useful for quick filtering in Total Commander) |
 
 ---
@@ -135,12 +141,12 @@ cmake --build . --config Release
 
 ### Build with MSVC:
 ```cmd
-cl /O2 /EHsc /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fe:aimg.wdx64 /link /DEF:src\aimg.def /MACHINE:X64
+cl /O2 /EHsc /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fe:aimg.wdx64 /link /DEF:src\aimg.def /MACHINE:X64
 ```
 
 ### Build with MinGW / GCC:
 ```bash
-g++ -O3 -shared -I src src/metadata_parser.cpp src/aimg_decoder.cpp src/aimg.cpp src/aimg.def -o aimg.wdx64 -static
+g++ -O3 -shared -I src src/metadata_parser.cpp src/aimg_decoder.cpp src/comfyui_decoder.cpp src/aimg.cpp src/aimg.def -o aimg.wdx64 -static
 ```
 
 ---

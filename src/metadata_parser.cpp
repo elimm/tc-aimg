@@ -1,4 +1,5 @@
 #include "metadata_parser.h"
+#include "aimg_abort.h"
 #include <fstream>
 #include <cstring>
 #include <algorithm>
@@ -14,6 +15,12 @@ struct BitStream {
     const uint8_t* data;
     size_t size;
     size_t bit_pos;
+    // Set once a read runs past the end. read_bits() still returns 0 there,
+    // which is indistinguishable from a genuine zero bit -- so every caller
+    // that acts on a value it just read (a length, a repeat count, a literal,
+    // a symbol) MUST check this, or a truncated stream decodes as fabricated
+    // zeros and reports success.
+    bool overrun = false;
 
     BitStream(const uint8_t* d, size_t s) : data(d), size(s), bit_pos(0) {}
 
@@ -22,7 +29,7 @@ struct BitStream {
         for (size_t i = 0; i < count; ++i) {
             size_t byte_idx = bit_pos / 8;
             size_t bit_idx = bit_pos % 8;
-            if (byte_idx >= size) return 0;
+            if (byte_idx >= size) { overrun = true; return 0; }
             uint32_t bit = (data[byte_idx] >> bit_idx) & 1;
             val |= (bit << i);
             bit_pos++;
@@ -31,11 +38,9 @@ struct BitStream {
     }
 };
 
-// Canonical Huffman decoder (puff.c-style range decoding): O(code length)
-// per symbol instead of a linear scan over every symbol for every bit. The
-// canonical code assignment in build() below hands out codes to symbols in
-// ascending (length, index) order, which is exactly the order this decode()
-// table walk requires.
+// Canonical Huffman decoder, puff.c-style range decoding: O(code length) per
+// symbol rather than a scan over every symbol per bit. build() assigns codes
+// in ascending (length, index) order, which is the order decode() walks.
 struct HuffmanDecoder {
     uint16_t count[16] = {0};   // number of codes of each length (1..15)
     std::vector<uint16_t> symbol; // symbols sorted by (length, original index)
@@ -55,7 +60,11 @@ struct HuffmanDecoder {
         symbol.assign(cnt, 0);
         for (size_t i = 0; i < cnt; i++) {
             uint8_t len = lengths[i];
-            if (len != 0) {
+            // Mirrors the counting loop's `< 16` guard. Unreachable today
+            // only because the code-length alphabet tops out at 15 -- i.e.
+            // safe by caller accident. Without it, len >= 16 indexes offs[16]
+            // out of bounds and writes through the result.
+            if (len != 0 && len < 16) {
                 symbol[offs[len]++] = (uint16_t)i;
             }
         }
@@ -79,23 +88,29 @@ struct HuffmanDecoder {
     }
 };
 
-// Cap on decompressed output size to prevent zip-bomb style memory exhaustion
-// from a maliciously crafted zTXt/iTXt chunk. Metadata text is never legitimately
-// this large.
+// Zip-bomb cap: metadata text is never legitimately this large.
 static const size_t kMaxInflateOutput = 32 * 1024 * 1024;
 
-static bool InflateBlock(BitStream& bs, std::vector<uint8_t>& out) {
+// BFINAL travels out through `outFinal` so the return value means exactly
+// one thing: false = corrupt, stop and keep what was already appended.
+// Conflating the two (returning `final_block != 0`) made "clean but not
+// last" and "corrupt" the same answer to the caller.
+static bool InflateBlock(BitStream& bs, std::vector<uint8_t>& out, bool& outFinal) {
     uint32_t final_block = bs.read_bits(1);
+    outFinal = final_block != 0;
     uint32_t block_type = bs.read_bits(2);
 
     if (block_type == 0) { // Uncompressed
         bs.bit_pos = (bs.bit_pos + 7) & ~7ULL; // align to byte
         uint32_t len = bs.read_bits(16);
         uint32_t nlen = bs.read_bits(16);
+        if (bs.overrun) return false; // truncated before len/nlen were both fully present
         if ((len ^ 0xFFFF) != nlen) return false;
         if (out.size() + len > kMaxInflateOutput) return false;
         for (uint32_t i = 0; i < len; i++) {
-            out.push_back((uint8_t)bs.read_bits(8));
+            uint32_t b = bs.read_bits(8);
+            if (bs.overrun) return false; // do not pad `out` with fabricated zeros
+            out.push_back((uint8_t)b);
         }
     } else if (block_type == 1 || block_type == 2) { // Huffman
         HuffmanDecoder lit_decoder, dist_decoder;
@@ -114,12 +129,14 @@ static bool InflateBlock(BitStream& bs, std::vector<uint8_t>& out) {
             uint32_t hlit = bs.read_bits(5) + 257;
             uint32_t hdist = bs.read_bits(5) + 1;
             uint32_t hclen = bs.read_bits(4) + 4;
+            if (bs.overrun) return false; // truncated before hlit/hdist/hclen were fully present
 
             static const uint8_t cl_order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
             uint8_t code_lens[19] = {0};
             for (uint32_t i = 0; i < hclen; i++) {
                 code_lens[cl_order[i]] = (uint8_t)bs.read_bits(3);
             }
+            if (bs.overrun) return false; // truncated mid code-length table
             HuffmanDecoder cl_decoder;
             cl_decoder.build(code_lens, 19);
 
@@ -127,21 +144,24 @@ static bool InflateBlock(BitStream& bs, std::vector<uint8_t>& out) {
             size_t idx = 0;
             while (idx < hlit + hdist) {
                 uint16_t sym = cl_decoder.decode(bs);
+                if (bs.overrun) return false; // truncated mid code-length symbol
                 if (sym < 16) {
                     combined_lens[idx++] = (uint8_t)sym;
                 } else if (sym == 16) {
                     uint32_t repeat = bs.read_bits(2) + 3;
+                    if (bs.overrun) return false;
                     uint8_t prev = idx > 0 ? combined_lens[idx - 1] : 0;
                     while (repeat-- > 0 && idx < combined_lens.size()) combined_lens[idx++] = prev;
                 } else if (sym == 17) {
                     uint32_t repeat = bs.read_bits(3) + 3;
+                    if (bs.overrun) return false;
                     while (repeat-- > 0 && idx < combined_lens.size()) combined_lens[idx++] = 0;
                 } else if (sym == 18) {
                     uint32_t repeat = bs.read_bits(7) + 11;
+                    if (bs.overrun) return false;
                     while (repeat-- > 0 && idx < combined_lens.size()) combined_lens[idx++] = 0;
                 } else {
-                    // Decode error (0xFFFF) or unexpected symbol: bail out instead
-                    // of spinning forever without making progress on `idx`.
+                    // Bail out rather than spin without advancing `idx`.
                     return false;
                 }
             }
@@ -165,38 +185,60 @@ static bool InflateBlock(BitStream& bs, std::vector<uint8_t>& out) {
         while (true) {
             if (out.size() >= kMaxInflateOutput) return false;
             uint16_t sym = lit_decoder.decode(bs);
+            if (bs.overrun) return false; // never decode a phantom zero-bit code
             if (sym == 256) break; // End of block
             if (sym < 256) {
                 out.push_back((uint8_t)sym);
             } else if (sym >= 257 && sym <= 285) {
                 uint32_t len_idx = sym - 257;
                 uint32_t length = length_base[len_idx] + bs.read_bits(length_extra[len_idx]);
+                if (bs.overrun) return false;
                 uint16_t dist_sym = dist_decoder.decode(bs);
-                if (dist_sym >= 30) break;
+                if (bs.overrun) return false;
+                // Inside this loop a `break` means end-of-block and nothing
+                // else: every error exit is a `return false`. A bad distance
+                // symbol, an out-of-range back-reference and an unassigned
+                // literal/length symbol are corrupt data, not a boundary --
+                // breaking here would report a clean non-final block and have
+                // InflateZlib re-enter mid-block on garbage.
+                if (dist_sym >= 30) return false;
                 uint32_t distance = dist_base[dist_sym] + bs.read_bits(dist_extra[dist_sym]);
+                if (bs.overrun) return false;
 
-                if (distance > out.size()) break;
+                if (distance > out.size()) return false;
                 if (out.size() + length > kMaxInflateOutput) return false;
                 size_t start = out.size() - distance;
                 for (uint32_t i = 0; i < length; i++) {
                     out.push_back(out[start + i]);
                 }
             } else {
-                break; // Error
+                return false; // Error: unassigned literal/length symbol (286/287)
             }
         }
     } else {
         return false;
     }
 
-    return final_block != 0;
+    return true;
 }
 
 static bool InflateZlib(const uint8_t* data, size_t size, std::vector<uint8_t>& out) {
     if (size < 2) return false;
+    // CM must be 8: deflate is the only method zlib/PNG define, and decoding
+    // from data + 2 assumes that two-byte header, not another framing.
+    if ((data[0] & 0x0F) != 8) return false;
+    // FDICT means a 4-byte DICTID follows the header, so decoding from
+    // data + 2 would read it as bitstream content and yield garbage
+    // indistinguishable from real text. FCHECK is deliberately NOT enforced:
+    // it shifts nothing structurally, and rejecting on it would throw out a
+    // non-conforming writer's otherwise-decodable stream.
+    if ((data[1] & 0x20) != 0) return false;
     BitStream bs(data + 2, size - 2);
     while (bs.bit_pos / 8 < size - 2 && out.size() < kMaxInflateOutput) {
-        if (InflateBlock(bs, out)) break;
+        if (AbortRequested()) return !out.empty(); // keep the clean prefix
+        bool final_block = false;
+        if (!InflateBlock(bs, out, final_block)) break; // corrupt: keep the clean prefix, stop
+        if (final_block) break;
     }
     return !out.empty();
 }
@@ -227,10 +269,15 @@ static uint32_t ReadU32LE(const uint8_t* p) {
 static std::string Utf16LEToUtf8(const uint8_t* data, size_t byteLen) {
     size_t wchar_count = byteLen / 2;
     if (wchar_count == 0) return "";
-    int reqSize = WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)data, (int)wchar_count, NULL, 0, NULL, NULL);
+    // `data` is an arbitrary offset into an EXIF tag buffer with no uint16_t
+    // alignment guarantee, so casting it to LPCWSTR is formally UB. Copy into
+    // an aligned buffer first, as Utf16BEToUtf8 already must for its swap.
+    std::vector<uint16_t> aligned(wchar_count);
+    memcpy(aligned.data(), data, wchar_count * 2);
+    int reqSize = WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)aligned.data(), (int)wchar_count, NULL, 0, NULL, NULL);
     if (reqSize <= 0) return "";
     std::string res(reqSize, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)data, (int)wchar_count, &res[0], reqSize, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)aligned.data(), (int)wchar_count, &res[0], reqSize, NULL, NULL);
     return res;
 }
 
@@ -248,15 +295,11 @@ static std::string Utf16BEToUtf8(const uint8_t* data, size_t byteLen) {
     return res;
 }
 
-// Sniff the actual byte order of a raw UTF-16 buffer holding mostly ASCII/Latin
-// generation-parameter text (prompts, "Steps:", "Negative prompt:", etc).
-// EXIF's "UNICODE\0" UserComment convention nominally follows the TIFF header's
-// byte order, but plenty of real-world writers (CivitAI preview downloaders,
-// among others) always emit UTF-16BE regardless of what the TIFF header says.
-// Trusting the header there silently swaps every byte pair, turning ASCII text
-// into garbage CJK-range codepoints. Since ASCII/Latin-1 code units always have
-// a zero high byte, whichever half of each 16-bit unit is mostly zero tells us
-// the true byte order; ties/empty input fall back to the caller-supplied guess.
+// EXIF's "UNICODE\0" UserComment nominally follows the TIFF header's byte
+// order, but plenty of real writers always emit UTF-16BE regardless, and
+// trusting the header there swaps every pair into garbage CJK codepoints.
+// ASCII/Latin code units have a zero high byte, so whichever half is mostly
+// zero gives the true order; a tie falls back to the caller's guess.
 static bool DetectUtf16IsLE(const uint8_t* data, size_t byteLen, bool headerIsLE) {
     size_t wchar_count = byteLen / 2;
     if (wchar_count == 0) return headerIsLE;
@@ -268,6 +311,22 @@ static bool DetectUtf16IsLE(const uint8_t* data, size_t byteLen, bool headerIsLE
     }
     if (zeroLow == zeroHigh) return headerIsLE;
     return zeroLow > zeroHigh;
+}
+
+// XMP stores a described value inside <rdf:Alt><rdf:li ...>TEXT</rdf:li>,
+// not as the tag's own text content, so reading the tag body verbatim puts
+// literal markup into text_chunks. Returns the input UNCHANGED (never a
+// truncated substring) when the container is absent or unterminated, so a
+// value that genuinely isn't wrapped is never mangled.
+static std::string UnwrapRdfAlt(const std::string& body) {
+    size_t liStart = body.find("<rdf:li");
+    if (liStart == std::string::npos) return body;
+    size_t tagEnd = body.find('>', liStart);
+    if (tagEnd == std::string::npos) return body;
+    size_t contentStart = tagEnd + 1;
+    size_t contentEnd = body.find("</rdf:li>", contentStart);
+    if (contentEnd == std::string::npos) return body;
+    return body.substr(contentStart, contentEnd - contentStart);
 }
 
 static std::string UnescapeXml(const std::string& input) {
@@ -292,21 +351,33 @@ static std::string UnescapeXml(const std::string& input) {
 static void ParseXMP(const std::string& xmpStr, RawImageMetadata& outMetadata) {
     outMetadata.text_chunks["xmp"] = xmpStr;
 
-    static const std::vector<std::string> tags = {
-        "exif:UserComment", "dc:description", "xmp:Description",
-        "ComfyUI:prompt", "ComfyUI:workflow", "prompt", "workflow"
+    // Markup spelled out as literals rather than built per tag per call from
+    // a vector of bare names: that cost 14 heap allocations on every XMP
+    // packet to reproduce compile-time-known text. Repeating the tag name
+    // three times per row is the honest price of no runtime string building.
+    struct XmpTag {
+        const char* name;
+        const char* open;
+        const char* close;
+    };
+    static const XmpTag kXmpTags[] = {
+        {"exif:UserComment", "<exif:UserComment>", "</exif:UserComment>"},
+        {"dc:description",   "<dc:description>",   "</dc:description>"},
+        {"xmp:Description",  "<xmp:Description>",  "</xmp:Description>"},
+        {"ComfyUI:prompt",   "<ComfyUI:prompt>",   "</ComfyUI:prompt>"},
+        {"ComfyUI:workflow", "<ComfyUI:workflow>", "</ComfyUI:workflow>"},
+        {"prompt",           "<prompt>",           "</prompt>"},
+        {"workflow",         "<workflow>",         "</workflow>"},
     };
 
-    for (const auto& tag : tags) {
-        std::string openTag = "<" + tag + ">";
-        std::string closeTag = "</" + tag + ">";
-        size_t start = xmpStr.find(openTag);
+    for (const auto& tag : kXmpTags) {
+        size_t start = xmpStr.find(tag.open);
         if (start != std::string::npos) {
-            start += openTag.size();
-            size_t end = xmpStr.find(closeTag, start);
+            start += strlen(tag.open);
+            size_t end = xmpStr.find(tag.close, start);
             if (end != std::string::npos) {
-                std::string val = UnescapeXml(xmpStr.substr(start, end - start));
-                outMetadata.text_chunks["xmp:" + tag] = val;
+                std::string val = UnescapeXml(UnwrapRdfAlt(xmpStr.substr(start, end - start)));
+                outMetadata.text_chunks[std::string("xmp:") + tag.name] = val;
             }
         }
     }
@@ -325,12 +396,10 @@ bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetad
     if (fileSize < 12) return false;
     file.seekg(0, std::ios::beg);
 
-    // Sniff the container signature from just the first 16 bytes -- no need
-    // to touch the rest of the file yet.
     uint8_t sig[16] = {0};
     size_t sigLen = (size_t)std::min<std::streamsize>(fileSize, sizeof(sig));
     file.read((char*)sig, (std::streamsize)sigLen);
-    sigLen = (size_t)file.gcount(); // a short/failed read leaves the rest of sig[] zeroed; shrink sigLen to what actually landed
+    sigLen = (size_t)file.gcount(); // a short read leaves sig[] zeroed past this point
 
     if (sigLen >= 8 && sig[0] == 0x89 && sig[1] == 'P' && sig[2] == 'N' && sig[3] == 'G') {
         file.seekg(8, std::ios::beg);
@@ -342,14 +411,17 @@ bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetad
         return ExtractJPEG(file, (uint64_t)fileSize, outMetadata);
     }
 
-    // WebP/AVIF/TIFF parsers work off an in-memory buffer: WebP's spec allows
-    // EXIF/XMP chunks to appear after the (large) image-data chunk, and TIFF
-    // IFD offsets are absolute file offsets that can point anywhere, so
-    // neither can assume metadata sits early like JPEG/PNG do.
+    if (AbortRequested()) return false; // no point starting the bounded read below
+
+    // These three need a buffer: WebP allows EXIF/XMP after the image data,
+    // and TIFF IFD offsets can point anywhere in the file, so neither can
+    // assume metadata sits early the way PNG/JPEG do.
     size_t readSize = (size_t)std::min<std::streamsize>(fileSize, 16 * 1024 * 1024);
     std::vector<uint8_t> buffer(readSize);
     file.seekg(0, std::ios::beg);
     file.read((char*)buffer.data(), (std::streamsize)readSize);
+    buffer.resize((size_t)file.gcount()); // a short read must not leave a fabricated tail of zeros to be walked as data
+    if (buffer.size() < 12) return false;
 
     if (sigLen >= 12 && memcmp(sig, "RIFF", 4) == 0 && memcmp(sig + 8, "WEBP", 4) == 0) {
         return ExtractWebP(buffer, outMetadata);
@@ -369,9 +441,8 @@ bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetad
 // PNG Extractor
 // ---------------------------------------------------------------------------
 
-// Shared by zTXt (always zlib-compressed) and iTXt (optionally compressed):
-// either zlib-inflate `data` or copy it as-is into `out`. Returns false if
-// `compressed` was requested and inflation failed (nothing to store).
+// Shared by zTXt (always compressed) and iTXt (optionally). False only when
+// inflation was asked for and failed.
 static bool DecodePngText(const uint8_t* data, size_t len, bool compressed, std::string& out) {
     if (compressed) {
         std::vector<uint8_t> decompressed;
@@ -391,11 +462,8 @@ static void StorePngText(RawImageMetadata& outMetadata, const std::string& key,
     }
 }
 
-// Packs a 4-byte chunk type tag into a single uint32_t so every chunk header
-// (including the routinely-skipped ones, e.g. IDAT) can be dispatched with
-// one integer comparison instead of building a std::string and running
-// several 4-char string compares against it -- this runs on every chunk in
-// the file, not just the text-ish ones.
+// Packs a chunk tag into a uint32_t so dispatch is one integer compare
+// instead of a std::string build -- this runs on every chunk, IDAT included.
 static constexpr uint32_t PackChunkType(char a, char b, char c, char d) {
     return ((uint32_t)(uint8_t)a << 24) | ((uint32_t)(uint8_t)b << 16) | ((uint32_t)(uint8_t)c << 8) | (uint32_t)(uint8_t)d;
 }
@@ -409,19 +477,17 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
     static const uint32_t kITXt = PackChunkType('i', 'T', 'X', 't');
     static const uint32_t kEXIf = PackChunkType('e', 'X', 'I', 'f');
 
-    // Every chunk except these (above all IDAT, the pixel data -- routinely
-    // most of an AI render's file size) is skipped via seekg() unread.
     auto isTextish = [](uint32_t t) {
         return t == kTEXt || t == kZTXt || t == kITXt || t == kEXIf;
     };
 
-    // Guards against a crafted chunk claiming an implausibly large length
-    // for a type we'd otherwise buffer -- genuine text/EXIF metadata is
-    // always small. Matches the existing zip-bomb-style cap philosophy
-    // elsewhere in this file (TinyDeflate::kMaxInflateOutput).
+    // A crafted chunk can claim an implausible length for a type that would
+    // otherwise be buffered; genuine metadata is always small.
     static const uint64_t kMaxTextChunkPayload = 16 * 1024 * 1024;
 
     while (pos + 8 <= fileSize) {
+        if (AbortRequested()) break; // stop walking, return what was found
+
         uint8_t header[8];
         file.read((char*)header, 8);
         if ((uint64_t)file.gcount() != 8) break;
@@ -479,14 +545,10 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
                     if (ptr <= end) {
                         size_t textLen = end - ptr;
                         bool compressed = (compFlag == 1 && compMethod == 0);
-                        // PNG's conventional home for an embedded XMP packet
-                        // (keyword "XML:com.adobe.xmp", per the XMP spec) --
-                        // route through ParseXMP the same way JPEG/WebP/AVIF's
-                        // XMP segments/chunks/boxes already do, instead of
-                        // dumping the whole raw XML/RDF text verbatim under
-                        // this literal keyword (which would otherwise make it
-                        // a candidate for the generic A1111/Fooocus text
-                        // matchers below -- see DecodeCore's "xmp" key skip).
+                        // PNG's standard home for an embedded XMP packet.
+                        // Routed through ParseXMP like every other container's
+                        // XMP, so its sub-fields land in "xmp:*" keys instead
+                        // of raw XML reaching the text matchers.
                         if (key == "XML:com.adobe.xmp") {
                             std::string text;
                             if (DecodePngText(ptr, textLen, compressed, text)) {
@@ -505,9 +567,8 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
             file.seekg(4, std::ios::cur); // skip CRC
             pos += 4;
         } else {
-            // Not a chunk type we care about (or a text-ish chunk too large
-            // to plausibly be real metadata): skip its payload + CRC without
-            // reading it into memory.
+            // Uninteresting, or too large to plausibly be metadata: skip the
+            // payload and CRC without reading them.
             file.seekg((std::streamoff)((uint64_t)length + 4), std::ios::cur);
             pos += (uint64_t)length + 4;
         }
@@ -526,14 +587,25 @@ bool MetadataParser::ExtractJPEG(std::ifstream& file, uint64_t fileSize, RawImag
     uint64_t pos = 2; // caller has already positioned `file` here, right after the SOI marker
 
     while (pos + 4 <= fileSize) {
+        if (AbortRequested()) break; // stop walking, return what was found
+
         file.seekg((std::streamoff)pos, std::ios::beg);
         uint8_t header[4];
         file.read((char*)header, 4);
         if ((uint64_t)file.gcount() != 4) break;
 
         if (header[0] != 0xFF) break;
+        // T.81 B.1.1.3 allows any number of 0xFF fill bytes before a marker.
+        // Treating one as the marker reads the length two bytes early and
+        // abandons the walk.
+        if (header[1] == 0xFF) { pos++; continue; }
         uint8_t marker = header[1];
-        if (marker == 0xDA || marker == 0xD9) break; // start-of-scan / end-of-image: entropy-coded pixel data follows, never read it
+        if (marker == 0xDA || marker == 0xD9) break; // SOS/EOI: entropy-coded data follows, never read it
+
+        // TEM, RSTn and SOI are standalone per T.81 and carry no length.
+        // Reading one anyway yields a nonsense length that fails the bounds
+        // check and silently drops every later metadata segment.
+        if (marker == 0x01 || marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7)) { pos += 2; continue; }
 
         uint32_t length = ReadU16BE(header + 2);
         if (length < 2) break;
@@ -583,7 +655,10 @@ bool MetadataParser::ExtractWebP(const std::vector<uint8_t>& buffer, RawImageMet
             ParseEXIF(chunkData, chunkSize, outMetadata);
         } else if (chunkType == "XMP ") {
             ParseXMP(std::string((const char*)chunkData, chunkSize), outMetadata);
-        } else if (chunkType != "VP8 " && chunkType != "VP8L" && chunkType != "VP8X" && chunkType != "ICCP" && chunkType != "ANIM" && chunkType != "ANMF") {
+        } else if (chunkType != "VP8 " && chunkType != "VP8L" && chunkType != "VP8X" && chunkType != "ICCP" && chunkType != "ANIM" && chunkType != "ANMF" && chunkType != "ALPH") {
+            // ALPH is the binary alpha plane, not text: without excluding it
+            // the catch-all below stores it as a metadata chunk and reports
+            // success on a file carrying no metadata at all.
             if (chunkSize > 4 && chunkSize < 2 * 1024 * 1024) {
                 outMetadata.text_chunks[chunkType] = std::string((const char*)chunkData, chunkSize);
             }
@@ -618,7 +693,10 @@ bool MetadataParser::ExtractISOBMFF_AVIF(const std::vector<uint8_t>& buffer, Raw
         if (boxSize < boxHeaderLen || pos + boxSize > (uint64_t)total) break;
 
         if (boxType == "meta") {
-            size_t innerPos = pos + 12;
+            // "meta" is a FullBox: its header (8 bytes, or 16 in the 64-bit
+            // largesize form) plus 4 bytes of version/flags precede the inner
+            // list. A hardcoded +12 misreads every inner box under largesize.
+            size_t innerPos = pos + boxHeaderLen + 4;
             size_t innerEnd = pos + (size_t)boxSize;
             while (innerPos + 8 <= innerEnd) {
                 uint32_t inSize = ReadU32BE(buffer.data() + innerPos);
@@ -689,10 +767,8 @@ bool MetadataParser::ParseEXIF(const uint8_t* data, size_t size, RawImageMetadat
         uint16_t count = Read16(tiffData + offset);
         size_t p = offset + 2;
 
-        // Byte length = component count * bytes-per-component of `type`, not
-        // count alone -- needed for the inline-vs-offset (<=4 bytes) decision
-        // and bounds check. Only matters once a multi-byte-component tag is
-        // added; all tags below are 1-byte-per-component (ASCII/BYTE/UNDEFINED).
+        // count * bytes-per-component, not count alone: this drives the
+        // inline-vs-offset decision and the bounds check.
         static const uint32_t kTiffTypeSize[] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
         constexpr uint16_t kTiffTypeCount = sizeof(kTiffTypeSize) / sizeof(kTiffTypeSize[0]);
 
@@ -704,6 +780,7 @@ bool MetadataParser::ParseEXIF(const uint8_t* data, size_t size, RawImageMetadat
 
             uint32_t elemSize = (type < kTiffTypeCount) ? kTiffTypeSize[type] : 0;
             if (elemSize == 0) continue; // unknown/unsupported type
+            if (cnt == 0) continue; // byteLen==0 would take the inline branch and store an empty entry
             uint64_t byteLen = (uint64_t)cnt * elemSize;
 
             if (byteLen > 4 && valOrOff + byteLen > (uint64_t)tiffSize) continue;
@@ -712,21 +789,26 @@ bool MetadataParser::ParseEXIF(const uint8_t* data, size_t size, RawImageMetadat
             if (tag == 0x8769) { // ExifIFDPointer
                 exifIFDOffset = valOrOff;
             } else if (tag == 0x9286) { // UserComment
-                if (cnt >= 8) {
-                    if (memcmp(valPtr, "UNICODE\0", 8) == 0) {
-                        bool actualIsLE = DetectUtf16IsLE(valPtr + 8, cnt - 8, isLE);
-                        outMetadata.text_chunks["exif:UserComment"] = actualIsLE ? Utf16LEToUtf8(valPtr + 8, cnt - 8) : Utf16BEToUtf8(valPtr + 8, cnt - 8);
-                    } else {
-                        // "ASCII\0\0\0" designator or anything else (undesignated/unrecognized):
-                        // treat as raw 8-bit text either way.
-                        outMetadata.text_chunks["exif:UserComment"] = std::string((const char*)valPtr + 8, cnt - 8);
-                    }
+                // Strip the 8-byte character-code designator only when it
+                // really is one of the four EXIF-defined values: plenty of
+                // real writers omit it and start the text at byte 0, and
+                // stripping unconditionally ate their first 8 characters.
+                static const uint8_t kAsciiDesignator[8] = {'A','S','C','I','I',0,0,0};
+                static const uint8_t kJisDesignator[8] = {'J','I','S',0,0,0,0,0};
+                static const uint8_t kUndefinedDesignator[8] = {0,0,0,0,0,0,0,0};
+                if (cnt >= 8 && memcmp(valPtr, "UNICODE\0", 8) == 0) {
+                    bool actualIsLE = DetectUtf16IsLE(valPtr + 8, cnt - 8, isLE);
+                    outMetadata.text_chunks["exif:UserComment"] = actualIsLE ? Utf16LEToUtf8(valPtr + 8, cnt - 8) : Utf16BEToUtf8(valPtr + 8, cnt - 8);
+                } else if (cnt >= 8 && (memcmp(valPtr, kAsciiDesignator, 8) == 0 ||
+                                        memcmp(valPtr, kJisDesignator, 8) == 0 ||
+                                        memcmp(valPtr, kUndefinedDesignator, 8) == 0)) {
+                    outMetadata.text_chunks["exif:UserComment"] = std::string((const char*)valPtr + 8, cnt - 8);
                 } else {
+                    // No designator (cnt < 8 included): keep the value whole.
                     outMetadata.text_chunks["exif:UserComment"] = std::string((const char*)valPtr, cnt);
                 }
             } else {
-                // ImageDescription/MakerNote/Artist/Software: plain raw-text tags,
-                // all stored the same way -- table lookup instead of one branch each.
+                // Plain raw-text tags, all stored identically.
                 static const struct { uint16_t tag; const char* key; } kPlainTextTags[] = {
                     {0x010e, "exif:ImageDescription"},
                     {0x927C, "exif:MakerNote"},

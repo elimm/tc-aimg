@@ -1,19 +1,16 @@
 #ifndef AIMG_DERIVED_H
 #define AIMG_DERIVED_H
 
-// Pure helpers for WDX fields that are computed on the fly from an already-
-// decoded AImgInfo (Size, LoRA) rather than parsed from raw metadata. Kept
-// header-only and dependency-free (just <string>) so tests/test_parser.cpp
-// can exercise them directly without linking aimg.cpp or loading the built
-// DLL.
+// Pure helpers for WDX fields derived from an already-decoded AImgInfo
+// (Size, LoRA) rather than parsed from raw metadata. Header-only and
+// dependency-free so they can be exercised without linking aimg.cpp.
 
 #include <string>
 #include <algorithm>
 #include <cmath>
 
-// Parses the "Size" field's "WxH" shape (as written by every decoder in
-// aimg_decoder.cpp) into positive width/height. Returns false on empty,
-// malformed, or zero/negative dimensions.
+// Parses the "Size" field's "WxH" shape. False on empty, malformed, or
+// zero/negative dimensions.
 inline bool ParseSize(const std::wstring& size, long& w, long& h) {
     size_t xPos = size.find(L'x');
     if (xPos == std::wstring::npos) return false;
@@ -55,9 +52,8 @@ inline bool ComputeMegapixels(const std::wstring& size, double& outMp) {
     return true;
 }
 
-// `lora` is the already-normalized ", "-joined list AImgDecoder::Decode
-// produces (see NormalizeLoraField), so every separator is a literal comma.
-// Returns 0 for an empty list.
+// `lora` is NormalizeLoraField's ", "-joined output, so every separator is a
+// literal comma.
 inline int CountLoraEntries(const std::wstring& lora) {
     if (lora.empty()) return 0;
     return static_cast<int>(std::count(lora.begin(), lora.end(), L',')) + 1;

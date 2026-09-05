@@ -32,7 +32,7 @@ jobs:
           )
           rc /fo aimg.res /i src src\aimg.rc
           if errorlevel 1 exit /b 1
-          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fe:%OUT% /link /DEF:src\aimg.def aimg.res /MACHINE:%MACHINE% /LTCG /OPT:REF /OPT:ICF
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fe:%OUT% /link /DEF:src\aimg.def aimg.res /MACHINE:%MACHINE% /LTCG /OPT:REF /OPT:ICF
           if errorlevel 1 exit /b 1
 
       - uses: actions/upload-artifact@v4
@@ -63,9 +63,9 @@ jobs:
           mkdir _tmp\mt _tmp\md
           rc /fo _tmp\aimg64.res /i src src\aimg.rc
           if errorlevel 1 exit /b 1
-          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\mt\\" /Fe:"_tmp\mt\aimg.wdx64" /link /DEF:src\aimg.def _tmp\aimg64.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fo"_tmp\mt\\" /Fe:"_tmp\mt\aimg.wdx64" /link /DEF:src\aimg.def _tmp\aimg64.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
           if errorlevel 1 exit /b 1
-          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MD /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\md\\" /Fe:"_tmp\md\aimg.wdx64" /link /DEF:src\aimg.def _tmp\aimg64.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MD /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fo"_tmp\md\\" /Fe:"_tmp\md\aimg.wdx64" /link /DEF:src\aimg.def _tmp\aimg64.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
           if errorlevel 1 exit /b 1
 
       - uses: ilammy/msvc-dev-cmd@v1
@@ -76,9 +76,9 @@ jobs:
         run: |
           rc /fo _tmp\aimg32.res /i src src\aimg.rc
           if errorlevel 1 exit /b 1
-          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\mt\\" /Fe:"_tmp\mt\aimg.wdx" /link /DEF:src\aimg.def _tmp\aimg32.res /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fo"_tmp\mt\\" /Fe:"_tmp\mt\aimg.wdx" /link /DEF:src\aimg.def _tmp\aimg32.res /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
           if errorlevel 1 exit /b 1
-          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /MD /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp /Fo"_tmp\md\\" /Fe:"_tmp\md\aimg.wdx" /link /DEF:src\aimg.def _tmp\aimg32.res /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+          cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MD /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fo"_tmp\md\\" /Fe:"_tmp\md\aimg.wdx" /link /DEF:src\aimg.def _tmp\aimg32.res /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
           if errorlevel 1 exit /b 1
 
       - name: Package installer archives

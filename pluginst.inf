@@ -1,6 +1,6 @@
 [plugininstall]
 description=AImg Metadata Content Plugin for Total Commander
-version=0.1.4
+version=0.2.0
 type=wdx
 file=aimg.wdx
 defaultdir=aimg

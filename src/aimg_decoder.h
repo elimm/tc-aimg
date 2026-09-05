@@ -9,15 +9,15 @@ namespace SimpleJson { struct JsonValue; }
 class AImgDecoder {
 public:
     static AImgInfo Decode(const RawImageMetadata& rawMeta);
+    // Public so aimg.cpp can reuse it for the lazy conversion of
+    // full_parameters_utf8 instead of carrying a second wrapper.
+    static std::wstring Utf8ToWstring(const std::string& str);
 
 private:
-    // Runs per-generator dispatch, then normalizes display fields (model/vae
-    // extension, LoRA formatting) uniformly across every generator's result.
+    // Per-generator dispatch, then display normalization (model/vae
+    // extension, LoRA shape) applied uniformly to every generator's result.
     static AImgInfo DecodeCore(const RawImageMetadata& rawMeta);
-    // Strips a known model-file extension so "model"/"vae" display a bare
-    // name regardless of whether the source generator included one.
     static std::wstring StripModelExtension(const std::wstring& name);
-    // Normalizes LoRA field shape across generators: no quotes, no extension.
     static std::wstring NormalizeLoraField(const std::wstring& raw);
 
     static bool DecodeAutomatic1111(const std::string& paramText, AImgInfo& info, bool populateFullParameters = true);
@@ -27,24 +27,14 @@ private:
     static bool DecodeSwarmUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
     static bool DecodeFooocus(const std::string& paramText, AImgInfo& info);
     static bool DecodeNovelAI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
-    // Custom, not folded into SimpleGeneratorConfig -- like Easy Diffusion,
-    // it has extra fields (a lora[] array, denoising "strength", nested
-    // v2.clipSkip) with no equivalent in that shared shape.
+    // Not folded into SimpleGeneratorConfig: extra fields (lora[] array,
+    // "strength", nested v2.clipSkip) with no equivalent in that shape.
     static bool DecodeDrawThings(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
-    // Custom, not folded into SimpleGeneratorConfig -- LoRA needs to be
-    // zipped from two parallel arrays (activated_loras / loras_multipliers),
-    // which the shared flat-key helper can't do.
+    // Not folded into SimpleGeneratorConfig: LoRA must be zipped from two
+    // parallel arrays, which the shared flat-key helper can't do.
     static bool DecodeWanGP(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
-    // Shared implementation for InvokeAI/SwarmUI/NovelAI (see definition site
-    // in aimg_decoder.cpp for why Easy Diffusion isn't folded in too). cfgVoid
-    // is a `const SimpleGeneratorConfig*` -- that type is file-local to
-    // aimg_decoder.cpp, hence the void* here rather than exposing it in this header.
-    static bool DecodeSimpleGraphGenerator(const SimpleJson::JsonValue* root, const std::string& originalText,
-                                            AImgInfo& info, const void* cfgVoid);
 
-    static std::wstring Utf8ToWstring(const std::string& str);
     static std::string Trim(const std::string& str);
-    static void ExtractSeedCfgSteps(const SimpleJson::JsonValue* jsonObj, const std::string& cfgKey, AImgInfo& info);
 };
 
 #endif // AIMG_DECODER_H

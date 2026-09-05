@@ -19,7 +19,7 @@ if exist "%TMPDIR%" rmdir /s /q "%TMPDIR%"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 mkdir "%TMPDIR%\mt" "%TMPDIR%\md"
 
-set SOURCES=src\metadata_parser.cpp src\aimg_decoder.cpp src\aimg.cpp
+set SOURCES=src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp
 
 REM Two runtime-linkage variants, both 32+64 bit:
 REM   mt = /MT  (static CRT)  -- self-contained, no VC++ Redistributable needed on target machine
@@ -38,12 +38,12 @@ if %errorlevel% neq 0 (
     echo Error compiling resource!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 64-bit /MT plugin!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx64" /link /DEF:src\aimg.def "%TMPDIR%\aimg64.res" /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 64-bit /MD plugin!
     exit /b %errorlevel%
@@ -62,12 +62,12 @@ if %errorlevel% neq 0 (
     echo Error compiling resource!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MT /LD /I src %SOURCES% /Fo"%TMPDIR%\mt\\" /Fe:"%TMPDIR%\mt\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 32-bit /MT plugin!
     exit /b %errorlevel%
 )
-cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MD /LD /I src %SOURCES% /Fo"%TMPDIR%\md\\" /Fe:"%TMPDIR%\md\aimg.wdx" /link /DEF:src\aimg.def "%TMPDIR%\aimg32.res" /MACHINE:X86 /LTCG /OPT:REF /OPT:ICF
 if %errorlevel% neq 0 (
     echo Error building 32-bit /MD plugin!
     exit /b %errorlevel%
