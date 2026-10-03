@@ -1,9 +1,53 @@
 #include "metadata_parser.h"
 #include "aimg_abort.h"
-#include <fstream>
 #include <cstring>
 #include <algorithm>
 #include <windows.h>
+
+// std::ifstream pulled the iostreams/locale machinery into the /MT build;
+// these Win32 calls keep the import table KERNEL32-only. FILE_SHARE_DELETE is
+// deliberate so Total Commander can rename/delete a file while it is being
+// read (MSVC's ifstream opened deny-none, i.e. read|write).
+class FileReader {
+public:
+    FileReader() = default;
+    ~FileReader() { if (h_ != INVALID_HANDLE_VALUE) CloseHandle(h_); }
+    FileReader(const FileReader&) = delete;
+    FileReader& operator=(const FileReader&) = delete;
+
+    bool Open(const std::wstring& path) {
+        h_ = CreateFileW(path.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        return h_ != INVALID_HANDLE_VALUE;
+    }
+    bool Size(uint64_t& out) const {
+        LARGE_INTEGER li;
+        if (!GetFileSizeEx(h_, &li) || li.QuadPart < 0) return false;
+        out = (uint64_t)li.QuadPart;
+        return true;
+    }
+    bool Seek(uint64_t absPos) {
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG)absPos;
+        return SetFilePointerEx(h_, li, nullptr, FILE_BEGIN) != 0;
+    }
+    bool Skip(uint64_t delta) {
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG)delta;
+        return SetFilePointerEx(h_, li, nullptr, FILE_CURRENT) != 0;
+    }
+    // Callers never ask for more than 16 MB, so one DWORD-sized ReadFile is enough.
+    size_t Read(void* dst, size_t n) {
+        if (n == 0 || n > MAXDWORD) return 0;
+        DWORD got = 0;
+        if (!ReadFile(h_, dst, (DWORD)n, &got, nullptr)) return 0;
+        return (size_t)got;
+    }
+
+private:
+    HANDLE h_ = INVALID_HANDLE_VALUE;
+};
 
 // ---------------------------------------------------------------------------
 // Tiny zlib Inflate implementation (RFC 1950 / RFC 1951) for zero dependencies
@@ -389,26 +433,25 @@ static void ParseXMP(const std::string& xmpStr, RawImageMetadata& outMetadata) {
 // ---------------------------------------------------------------------------
 
 bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetadata& outMetadata) {
-    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) return false;
+    FileReader file;
+    if (!file.Open(filePath)) return false;
 
-    std::streamsize fileSize = file.tellg();
+    uint64_t fileSize = 0;
+    if (!file.Size(fileSize)) return false;
     if (fileSize < 12) return false;
-    file.seekg(0, std::ios::beg);
 
     uint8_t sig[16] = {0};
-    size_t sigLen = (size_t)std::min<std::streamsize>(fileSize, sizeof(sig));
-    file.read((char*)sig, (std::streamsize)sigLen);
-    sigLen = (size_t)file.gcount(); // a short read leaves sig[] zeroed past this point
+    size_t sigLen = (size_t)std::min<uint64_t>(fileSize, sizeof(sig));
+    sigLen = file.Read(sig, sigLen); // a short read leaves sig[] zeroed past this point
 
     if (sigLen >= 8 && sig[0] == 0x89 && sig[1] == 'P' && sig[2] == 'N' && sig[3] == 'G') {
-        file.seekg(8, std::ios::beg);
-        return ExtractPNG(file, (uint64_t)fileSize, outMetadata);
+        if (!file.Seek(8)) return false;
+        return ExtractPNG(file, fileSize, outMetadata);
     }
 
     if (sigLen >= 2 && sig[0] == 0xFF && sig[1] == 0xD8) {
-        file.seekg(2, std::ios::beg);
-        return ExtractJPEG(file, (uint64_t)fileSize, outMetadata);
+        if (!file.Seek(2)) return false;
+        return ExtractJPEG(file, fileSize, outMetadata);
     }
 
     if (AbortRequested()) return false; // no point starting the bounded read below
@@ -416,11 +459,10 @@ bool MetadataParser::ExtractMetadata(const std::wstring& filePath, RawImageMetad
     // These three need a buffer: WebP allows EXIF/XMP after the image data,
     // and TIFF IFD offsets can point anywhere in the file, so neither can
     // assume metadata sits early the way PNG/JPEG do.
-    size_t readSize = (size_t)std::min<std::streamsize>(fileSize, 16 * 1024 * 1024);
+    size_t readSize = (size_t)std::min<uint64_t>(fileSize, 16 * 1024 * 1024);
     std::vector<uint8_t> buffer(readSize);
-    file.seekg(0, std::ios::beg);
-    file.read((char*)buffer.data(), (std::streamsize)readSize);
-    buffer.resize((size_t)file.gcount()); // a short read must not leave a fabricated tail of zeros to be walked as data
+    if (!file.Seek(0)) return false;
+    buffer.resize(file.Read(buffer.data(), readSize)); // a short read must not leave a fabricated tail of zeros to be walked as data
     if (buffer.size() < 12) return false;
 
     if (sigLen >= 12 && memcmp(sig, "RIFF", 4) == 0 && memcmp(sig + 8, "WEBP", 4) == 0) {
@@ -468,7 +510,7 @@ static constexpr uint32_t PackChunkType(char a, char b, char c, char d) {
     return ((uint32_t)(uint8_t)a << 24) | ((uint32_t)(uint8_t)b << 16) | ((uint32_t)(uint8_t)c << 8) | (uint32_t)(uint8_t)d;
 }
 
-bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata) {
+bool MetadataParser::ExtractPNG(FileReader& file, uint64_t fileSize, RawImageMetadata& outMetadata) {
     uint64_t pos = 8; // caller has already positioned `file` here, right after the signature
 
     static const uint32_t kIEND = PackChunkType('I', 'E', 'N', 'D');
@@ -489,8 +531,7 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
         if (AbortRequested()) break; // stop walking, return what was found
 
         uint8_t header[8];
-        file.read((char*)header, 8);
-        if ((uint64_t)file.gcount() != 8) break;
+        if (file.Read(header, 8) != 8) break;
 
         uint32_t length = ReadU32BE(header);
         uint32_t chunkType = ReadU32BE(header + 4);
@@ -503,8 +544,7 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
         if (isTextish(chunkType) && length <= kMaxTextChunkPayload) {
             std::vector<uint8_t> chunkData(length);
             if (length > 0) {
-                file.read((char*)chunkData.data(), (std::streamsize)length);
-                if ((uint64_t)file.gcount() != length) break;
+                if (file.Read(chunkData.data(), length) != length) break;
             }
             const uint8_t* data = chunkData.data();
 
@@ -564,16 +604,14 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
             }
 
             pos += length;
-            file.seekg(4, std::ios::cur); // skip CRC
+            if (!file.Skip(4)) break; // skip CRC
             pos += 4;
         } else {
             // Uninteresting, or too large to plausibly be metadata: skip the
             // payload and CRC without reading them.
-            file.seekg((std::streamoff)((uint64_t)length + 4), std::ios::cur);
+            if (!file.Skip((uint64_t)length + 4)) break;
             pos += (uint64_t)length + 4;
         }
-
-        if (!file.good()) break;
     }
 
     return !outMetadata.text_chunks.empty();
@@ -583,16 +621,15 @@ bool MetadataParser::ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImage
 // JPEG Extractor
 // ---------------------------------------------------------------------------
 
-bool MetadataParser::ExtractJPEG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata) {
+bool MetadataParser::ExtractJPEG(FileReader& file, uint64_t fileSize, RawImageMetadata& outMetadata) {
     uint64_t pos = 2; // caller has already positioned `file` here, right after the SOI marker
 
     while (pos + 4 <= fileSize) {
         if (AbortRequested()) break; // stop walking, return what was found
 
-        file.seekg((std::streamoff)pos, std::ios::beg);
+        if (!file.Seek(pos)) break;
         uint8_t header[4];
-        file.read((char*)header, 4);
-        if ((uint64_t)file.gcount() != 4) break;
+        if (file.Read(header, 4) != 4) break;
 
         if (header[0] != 0xFF) break;
         // T.81 B.1.1.3 allows any number of 0xFF fill bytes before a marker.
@@ -615,8 +652,7 @@ bool MetadataParser::ExtractJPEG(std::ifstream& file, uint64_t fileSize, RawImag
         if (marker == 0xE1 || marker == 0xFE) {
             std::vector<uint8_t> payload(payloadLen);
             if (payloadLen > 0) {
-                file.read((char*)payload.data(), (std::streamsize)payloadLen);
-                if ((uint64_t)file.gcount() != payloadLen) break;
+                if (file.Read(payload.data(), payloadLen) != payloadLen) break;
             }
             if (marker == 0xE1) {
                 ParseEXIF(payload.data(), payloadLen, outMetadata);

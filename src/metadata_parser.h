@@ -4,7 +4,9 @@
 #include <string>
 #include <map>
 #include <vector>
-#include <fstream>
+#include <cstdint>
+
+class FileReader;
 
 struct RawImageMetadata {
     // Raw text keyed by container-level name: "parameters", "prompt",
@@ -23,12 +25,12 @@ public:
 
 private:
     // Streamed, not buffered: IDAT dwarfs everything else in a typical
-    // multi-MB render and is skipped with seekg() rather than read.
+    // multi-MB render and is skipped by seeking rather than read.
     // `file` must be positioned right after the 8-byte PNG signature.
-    static bool ExtractPNG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata);
+    static bool ExtractPNG(FileReader& file, uint64_t fileSize, RawImageMetadata& outMetadata);
     // Streamed like ExtractPNG, stopping at SOS/EOI so the entropy-coded
     // scan data is never read. `file` must be positioned after the SOI.
-    static bool ExtractJPEG(std::ifstream& file, uint64_t fileSize, RawImageMetadata& outMetadata);
+    static bool ExtractJPEG(FileReader& file, uint64_t fileSize, RawImageMetadata& outMetadata);
     static bool ExtractWebP(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata);
     static bool ExtractISOBMFF_AVIF(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata);
     static bool ExtractTIFF(const std::vector<uint8_t>& buffer, RawImageMetadata& outMetadata);

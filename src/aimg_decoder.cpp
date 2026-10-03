@@ -62,14 +62,14 @@ class JsonParser {
                 else if (esc == 'u' && pos + 4 <= src.size()) {
                     std::string hexStr = src.substr(pos, 4);
                     pos += 4;
-                    uint32_t codepoint = (uint32_t)strtoul(hexStr.c_str(), NULL, 16);
+                    uint32_t codepoint = (uint32_t)AImgDecoderInternal::ParseHexPrefix(hexStr.c_str());
 
                     // Combine with a following low surrogate into the full
                     // astral codepoint (e.g. an emoji).
                     if (codepoint >= 0xD800 && codepoint <= 0xDBFF &&
                         pos + 6 <= src.size() && src[pos] == '\\' && src[pos + 1] == 'u') {
                         std::string lowHex = src.substr(pos + 2, 4);
-                        uint32_t low = (uint32_t)strtoul(lowHex.c_str(), NULL, 16);
+                        uint32_t low = (uint32_t)AImgDecoderInternal::ParseHexPrefix(lowHex.c_str());
                         if (low >= 0xDC00 && low <= 0xDFFF) {
                             pos += 6;
                             codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
@@ -168,7 +168,9 @@ public:
             while (pos < src.size() && (isdigit((unsigned char)src[pos]) || src[pos] == '.' || src[pos] == 'e' || src[pos] == 'E' || src[pos] == '+' || src[pos] == '-')) {
                 pos++;
             }
-            val->numVal = strtod(src.c_str() + start, NULL);
+            const char* numEnd;
+            // A lone "-" has no digit; numVal stays 0 as strtod's result did.
+            if (!AImgDecoderInternal::ParseDouble(src.c_str() + start, &numEnd, val->numVal)) val->numVal = 0.0;
             return val;
         } else if (src.compare(pos, 4, "true") == 0) {
             val->type = JsonType::Bool; val->boolVal = true; pos += 4; return val;
@@ -183,6 +185,15 @@ public:
 };
 
 } // namespace SimpleJson
+
+namespace AImgDecoderInternal {
+// The parsed tree owns copies of every string, so it safely outlives `text`
+// even though JsonParser itself only holds a reference to it.
+std::unique_ptr<SimpleJson::JsonValue> ParseJson(const std::string& text) {
+    SimpleJson::JsonParser parser(text);
+    return parser.parse();
+}
+} // namespace AImgDecoderInternal
 
 
 // ---------------------------------------------------------------------------
@@ -285,9 +296,9 @@ bool JsonNumericValue(const SimpleJson::JsonValue* v, double& out) {
     }
     if (v->type == SimpleJson::JsonType::String) {
         const char* s = v->strVal.c_str();
-        char* endptr = nullptr;
-        double parsed = strtod(s, &endptr);
-        if (endptr == s) return false; // no digits consumed at all
+        const char* endptr = nullptr;
+        double parsed;
+        if (!AImgDecoderInternal::ParseDouble(s, &endptr, parsed)) return false; // no digits consumed at all
         while (*endptr == ' ' || *endptr == '\t' || *endptr == '\r' || *endptr == '\n') endptr++;
         if (*endptr != '\0') return false; // trailing junk ("7 steps"): not a pure numeric string
         out = parsed;
@@ -311,6 +322,38 @@ void ExtractSeedCfgSteps(const SimpleJson::JsonValue* jsonObj, const std::string
         info.has_steps = true;
     }
 }
+
+// ComfyUI's A1111-compat save nodes pack "Sampler: <sampler> <scheduler>"
+// into one value with no "Schedule type:" key. Splits off a trailing known
+// ComfyUI scheduler name (separator " " or "_"; an "_" inside the scheduler
+// name also matches a space, e.g. "SGM Uniform"). Only ever called on a
+// "Version: ComfyUI" block, so "DPM++ 2M Karras" is never split.
+void SplitComfyUISamplerScheduler(std::wstring& sampler, std::wstring& scheduler) {
+    static const wchar_t* kSchedulers[] = {
+        L"simple", L"normal", L"karras", L"exponential", L"sgm_uniform",
+        L"beta", L"ddim_uniform", L"linear_quadratic", L"kl_optimal"
+    };
+    for (const wchar_t* sched : kSchedulers) {
+        size_t schedLen = wcslen(sched);
+        if (sampler.size() <= schedLen) continue;
+        size_t sp = sampler.size() - schedLen - 1;
+        // "er_sde_simple" also occurs: no ComfyUI sampler name itself ends in
+        // "_<scheduler>", and this only runs on a Version: ComfyUI block.
+        if (sampler[sp] != L' ' && sampler[sp] != L'_') continue;
+        bool match = true;
+        for (size_t i = 0; i < schedLen; i++) {
+            wchar_t c = sampler[sp + 1 + i];
+            if (sched[i] == L'_' ? (c != L'_' && c != L' ') : towlower(c) != (wchar_t)sched[i]) { match = false; break; }
+        }
+        if (match) {
+            scheduler = sampler.substr(sp + 1);
+            std::wstring samplerPart = sampler.substr(0, sp);
+            size_t last = samplerPart.find_last_not_of(L" \t\r\n");
+            sampler = (last == std::wstring::npos) ? std::wstring() : samplerPart.substr(0, last + 1);
+            return;
+        }
+    }
+}
 } // namespace
 
 
@@ -318,57 +361,61 @@ void ExtractSeedCfgSteps(const SimpleJson::JsonValue* jsonObj, const std::string
 // Main AImgDecoder Entry Point
 // ---------------------------------------------------------------------------
 
-std::wstring AImgDecoder::StripModelExtension(const std::wstring& name) {
+namespace {
+// Length of the model-file extension ending range [b, e) of `s`, or 0. The
+// range must be strictly longer than the extension, so a bare ".pt" stays.
+// Shared by StripModelExtension and NormalizeLoraField so they cannot drift.
+size_t ModelExtLen(const std::wstring& s, size_t b, size_t e) {
     static const wchar_t* kExts[] = { L".safetensors", L".ckpt", L".pt", L".pth", L".bin", L".gguf" };
+    size_t n = e - b;
     for (const wchar_t* ext : kExts) {
         size_t extLen = wcslen(ext);
-        if (name.size() <= extLen) continue;
-        size_t pos = name.size() - extLen;
+        if (n <= extLen) continue;
+        size_t pos = e - extLen;
         bool match = true;
         for (size_t i = 0; i < extLen; i++) {
-            if (towlower(name[pos + i]) != towlower((wchar_t)ext[i])) { match = false; break; }
+            if (towlower(s[pos + i]) != towlower((wchar_t)ext[i])) { match = false; break; }
         }
-        if (match) return name.substr(0, pos);
+        if (match) return extLen;
     }
-    return name;
+    return 0;
+}
+} // namespace
+
+std::wstring AImgDecoder::StripModelExtension(const std::wstring& name) {
+    return name.substr(0, name.size() - ModelExtLen(name, 0, name.size()));
 }
 
 std::wstring AImgDecoder::NormalizeLoraField(const std::wstring& raw) {
     if (raw.empty()) return raw;
     // LoRA arrives in several shapes per generator (quoted "name: hash"
     // lists, bare filenames with extensions). This is the one place they all
-    // funnel through, so every file displays the same shape.
-    std::vector<std::wstring> parts;
-    size_t start = 0;
-    while (start <= raw.size()) {
+    // funnel through, so every file displays the same shape. Index ranges
+    // over `raw`: one output allocation, not several per entry.
+    const size_t n = raw.size();
+    std::wstring result;
+    result.reserve(n);
+    for (size_t start = 0; start <= n;) {
         size_t comma = raw.find(L',', start);
-        std::wstring part = (comma == std::wstring::npos) ? raw.substr(start) : raw.substr(start, comma - start);
-
-        size_t a = part.find_first_not_of(L" \t");
-        if (a == std::wstring::npos) { part.clear(); }
-        else {
-            size_t b = part.find_last_not_of(L" \t");
-            part = part.substr(a, b - a + 1);
+        size_t b = start, e = (comma == std::wstring::npos) ? n : comma;
+        while (b < e && (raw[b] == L' ' || raw[b] == L'\t')) b++;
+        while (e > b && (raw[e - 1] == L' ' || raw[e - 1] == L'\t')) e--;
+        if (b < e && raw[b] == L'"') b++;
+        if (b < e && raw[e - 1] == L'"') e--;
+        if (b < e) {
+            // Bounded to this part: a raw.find() would rescan the rest of the
+            // list for every colon-less entry.
+            size_t colon = b;
+            while (colon + 1 < e && !(raw[colon] == L':' && raw[colon + 1] == L' ')) colon++;
+            bool hasColon = colon + 1 < e;
+            size_t nameEnd = hasColon ? colon : e;
+            nameEnd -= ModelExtLen(raw, b, nameEnd);
+            if (!result.empty()) result += L", ";
+            result.append(raw, b, nameEnd - b);
+            if (hasColon) result.append(raw, colon, e - colon);
         }
-        if (!part.empty() && part.front() == L'"') part.erase(part.begin());
-        if (!part.empty() && part.back() == L'"') part.pop_back();
-
-        size_t colonPos = part.find(L": ");
-        if (colonPos != std::wstring::npos) {
-            part = StripModelExtension(part.substr(0, colonPos)) + part.substr(colonPos);
-        } else {
-            part = StripModelExtension(part);
-        }
-
-        if (!part.empty()) parts.push_back(part);
         if (comma == std::wstring::npos) break;
         start = comma + 1;
-    }
-
-    std::wstring result;
-    for (const auto& p : parts) {
-        if (!result.empty()) result += L", ";
-        result += p;
     }
     return result;
 }
@@ -435,6 +482,26 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
         return cand.key && *cand.key == "xmp";
     };
 
+    // The companion gap-fill loop's loose A1111 gate can also match the graph
+    // JSON itself (a note widget saying "Steps:" is enough), which MergeGaps
+    // would then write whole into the prompt fields. Reject graph chunks by
+    // key, or a leading '{' with no line-start "Steps:"/"Negative prompt:"
+    // (serialized JSON never holds a raw newline in a string; a real prompt
+    // can still be JSON-styled text). No getJson here: that is the very parse
+    // this loop avoids.
+    auto trimWs = [](const std::wstring& w) {
+        size_t b = w.find_first_not_of(L" \t\r\n");
+        if (b == std::wstring::npos) return std::wstring();
+        return w.substr(b, w.find_last_not_of(L" \t\r\n") - b + 1);
+    };
+    auto isJsonShapedCompanion = [](const Candidate& cand) {
+        if (cand.key && (*cand.key == "prompt" || *cand.key == "workflow")) return true;
+        const std::string& t = cand.text();
+        return !t.empty() && t[0] == '{' &&
+               t.find("\nSteps:") == std::string::npos &&
+               t.find("\nNegative prompt:") == std::string::npos;
+    };
+
     std::vector<Candidate> candidates;
     bool hasComfyUIChunk = false;
     // See the seed override below: a "prompt" chunk is authoritative, so
@@ -495,15 +562,34 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
         return cand.json.get();
     };
 
-    // 1. Try ComfyUI on any candidate that parsed as a JSON object
+    // 1. Try ComfyUI on any candidate that parsed as a JSON object, in
+    // priority order: prompt, workflow, then the rest in map order. A
+    // metadata-hub chunk embedding its own copy of the workflow sorts before
+    // "prompt" and would otherwise win with stale UI-format values. Only this
+    // loop's order changes; every other candidate loop keeps map order.
+    std::vector<Candidate*> comfyOrder;
+    Candidate* promptCand = nullptr;
+    Candidate* workflowCand = nullptr;
     for (auto& cand : candidates) {
+        if (!promptCand && cand.key && *cand.key == "prompt") promptCand = &cand;
+        else if (!workflowCand && cand.key && *cand.key == "workflow") workflowCand = &cand;
+    }
+    if (promptCand) comfyOrder.push_back(promptCand);
+    if (workflowCand) comfyOrder.push_back(workflowCand);
+    for (auto& cand : candidates) {
+        if (&cand != promptCand && &cand != workflowCand) comfyOrder.push_back(&cand);
+    }
+    for (auto* candPtr : comfyOrder) {
+        auto& cand = *candPtr;
         SimpleJson::JsonValue* json = getJson(cand);
         if (json && DecodeComfyUI(json, cand.text(), info)) {
             // Some metadata-saving nodes embed a flattened A1111-style text
             // block alongside the graph, carrying fields no node holds. Fill
             // only the gaps; the graph's own values are more precise.
             for (const auto& cand2 : candidates) {
+                if (&cand2 == &cand) continue; // see isJsonShapedCompanion's comment above
                 if (isRawXmpWrapper(cand2)) continue; // see isRawXmpWrapper's comment above
+                if (isJsonShapedCompanion(cand2)) continue;
                 AImgInfo fallback;
                 if (!DecodeAutomatic1111(cand2.text(), fallback, /*populateFullParameters=*/false)) continue;
                 // "workflow" is a live UI snapshot, not an execution record:
@@ -514,6 +600,15 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
                 if (!hasPromptChunk && fallback.has_seed) {
                     info.seed = fallback.seed;
                     info.has_seed = true;
+                }
+                // Some save nodes write the positive prompt into the negative
+                // slot too (graph negative zeroed out), or leave the prompt
+                // line empty and put the positive under "Negative prompt:". A
+                // negative equal to either prompt is that artifact: drop it.
+                std::wstring trimmedFallbackNeg = trimWs(fallback.negative_prompt);
+                if (!trimmedFallbackNeg.empty() &&
+                    (trimmedFallbackNeg == trimWs(fallback.prompt) || trimmedFallbackNeg == trimWs(info.prompt))) {
+                    fallback.negative_prompt.clear();
                 }
                 MergeGaps(info, fallback);
                 break;
@@ -596,6 +691,157 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
 // Automatic1111 Decoder
 // ---------------------------------------------------------------------------
 
+namespace {
+// LoRA name handling works on UTF-8 byte spans: names only ever need ASCII
+// case folding (non-ASCII bytes compare exactly), and the whole list is
+// converted to UTF-16 once at the end.
+struct LoraSpan { const char* b; const char* e; };
+
+char LoraLow(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+
+bool LoraCiEq(const char* a, const char* b, size_t n) {
+    for (size_t i = 0; i < n; i++) if (LoraLow(a[i]) != LoraLow(b[i])) return false;
+    return true;
+}
+
+LoraSpan LoraTrim(LoraSpan s, bool quotes) {
+    auto skip = [quotes](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || (quotes && c == '"'); };
+    while (s.b < s.e && skip(*s.b)) s.b++;
+    while (s.e > s.b && skip(s.e[-1])) s.e--;
+    return s;
+}
+
+// Same extension list as StripModelExtension, ASCII case-insensitive.
+LoraSpan LoraNoExt(LoraSpan s) {
+    static const char* const kExts[] = { ".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf" };
+    size_t n = (size_t)(s.e - s.b);
+    for (const char* ext : kExts) {
+        size_t el = strlen(ext);
+        if (n > el && LoraCiEq(s.e - el, ext, el)) { s.e -= el; break; }
+    }
+    return s;
+}
+
+LoraSpan LoraBase(LoraSpan s) {
+    for (const char* p = s.e; p > s.b; p--) if (p[-1] == '\\' ||p[-1] == '/') return LoraSpan{p, s.e};
+    return s;
+}
+
+bool LoraEq(LoraSpan a, LoraSpan b) {
+    return (a.e - a.b) == (b.e - b.b) && LoraCiEq(a.b, b.b, (size_t)(a.e - a.b));
+}
+
+// Dedupe key per listed name, computed once: extension stripped, plus the
+// basename of that. Spans point into the caller's prompt/hashNames, which
+// outlive the call (never into `out`, which reallocates).
+// Each span also carries a case-folded hash, so the quadratic dedupe compares
+// characters only on a hash hit.
+struct LoraKey { LoraSpan noExt, base; uint32_t hNoExt, hBase; };
+
+uint32_t LoraHash(LoraSpan s) {
+    uint32_t h = 2166136261u;
+    for (const char* p = s.b; p < s.e; p++) h = (h ^ (uint8_t)LoraLow(*p)) * 16777619u;
+    return h;
+}
+
+LoraKey LoraMakeKey(LoraSpan name) {
+    LoraKey k;
+    k.noExt = LoraNoExt(name);
+    k.base = LoraBase(k.noExt);
+    k.hNoExt = LoraHash(k.noExt);
+    k.hBase = LoraHash(k.base);
+    return k;
+}
+
+// Same LoRA when equal after extension stripping, or when one equals the
+// other's basename: prompt tags and hash lists disagree on whether a folder
+// prefix is written.
+bool LoraSameKey(const LoraKey& a, const LoraKey& b) {
+    return (a.hNoExt == b.hNoExt && LoraEq(a.noExt, b.noExt)) ||
+           (a.hBase == b.hNoExt && LoraEq(a.base, b.noExt)) ||
+           (a.hNoExt == b.hBase && LoraEq(a.noExt, b.base));
+}
+
+// Appends the name to `out` (", "-separated) and its key to `keys` unless an
+// already-listed name matches. Returns whether it was new. Keys are computed
+// once per name so a long list does not re-scan every earlier name's
+// extension and basename on each comparison.
+bool LoraAddName(std::string& out, std::vector<LoraKey>& keys, LoraSpan name) {
+    LoraKey n = LoraMakeKey(name);
+    for (const LoraKey& k : keys) if (LoraSameKey(k, n)) return false;
+    keys.push_back(n);
+    if (!out.empty()) out += ", ";
+    out.append(name.b, name.e);
+    return true;
+}
+
+// "name: hash, name2: hash2" (whole value and/or each entry may be quoted)
+// -> one name per line appended to `out`. Cut at the LAST ": " so the hash is
+// always removed.
+void LoraNamesFromHashList(const std::string& list, std::string& out) {
+    const char* end = list.data() + list.size();
+    for (const char* p = list.data(); p <= end;) {
+        const char* comma = (const char*)memchr(p, ',', (size_t)(end - p));
+        LoraSpan part = LoraTrim(LoraSpan{p, comma ? comma : end}, true);
+        for (const char* q = part.e; q - 2 >= part.b; q--) {
+            if (q[-2] == ':' && q[-1] == ' ') { part.e = q - 2; break; }
+        }
+        part = LoraTrim(part, false);
+        if (part.b < part.e) { out.append(part.b, part.e); out += '\n'; }
+        if (!comma) break;
+        p = comma + 1;
+    }
+}
+
+// "Lora hashes" carries name: hash, nothing about strength; weights live in
+// the prompt's <lora:NAME:WEIGHT> tags. Returns "NAME: WEIGHT" per tag, then
+// the hash-list names no tag covered. Empty means leave info.lora alone (e.g.
+// a verbatim "Loras" value and no tags).
+
+std::string BuildLoraList(const std::string& prompt, const std::string& hashNames, bool lorasKeyPresent) {
+    std::string out;
+    std::vector<LoraKey> keys;
+    const char* end = prompt.data() + prompt.size();
+    for (const char* p = prompt.data(); (p = (const char*)memchr(p, '<', (size_t)(end - p))) != nullptr;) {
+        if (end - p < 6 || !(LoraCiEq(p + 1, "lora:", 5) || LoraCiEq(p + 1, "lyco:", 5))) { p++; continue; }
+        const char* bs = p + 6;
+        const char* close = (const char*)memchr(bs, '>', (size_t)(end - bs));
+        if (!close) break;
+        p = close + 1;
+        const char* c1 = (const char*)memchr(bs, ':', (size_t)(close - bs));
+        LoraSpan name = LoraTrim(LoraSpan{bs, c1 ? c1 : close}, false);
+        if (name.b == name.e || !LoraAddName(out, keys, name)) continue;
+        if (!c1) continue;
+        const char* c2 = (const char*)memchr(c1 + 1, ':', (size_t)(close - c1 - 1));
+        LoraSpan w = LoraTrim(LoraSpan{c1 + 1, c2 ? c2 : close}, false);
+        if (w.b == w.e) continue;
+        std::string ws(w.b, w.e);
+        const char* pe = nullptr;
+        double v = 0;
+        out += ": ";
+        if (AImgDecoderInternal::ParseDouble(ws.c_str(), &pe, v) && *pe == '\0' && std::fabs(v) < 1e15) {
+            // Six places, not FormatCompactNumber's two: 0.125 must not show
+            // as 0.13. Trailing zeros (and a bare dot) are trimmed.
+            ws = AImgDecoderInternal::FormatFixed(v, 6);
+            size_t dot = ws.find('.');
+            if (dot != std::string::npos) {
+                size_t last = ws.find_last_not_of('0');
+                if (last == dot) last--;
+                ws.erase(last + 1);
+            }
+        }
+        out += ws;
+    }
+    if (out.empty() && lorasKeyPresent) return out;
+    for (const char* p = hashNames.data(), *he = p + hashNames.size(); p < he;) {
+        const char* nl = (const char*)memchr(p, '\n', (size_t)(he - p));
+        if (nl != p) LoraAddName(out, keys, LoraSpan{p, nl});
+        p = nl + 1;
+    }
+    return out;
+}
+} // namespace
+
 bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& info, bool populateFullParameters) {
     if (paramText.empty()) return false;
 
@@ -607,6 +853,9 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
 
     info.has_metadata = true;
     info.generator = L"Automatic1111";
+    // Set only by this block's own "Version: ComfyUI" key, not by any other
+    // ComfyUI relabel: only that key licenses the sampler/scheduler split.
+    bool isComfyUIVersionBlock = false;
     // The gap-fill caller never reads full_parameters_utf8 off its result,
     // so don't copy the whole companion text block just to discard it.
     if (populateFullParameters) info.full_parameters_utf8 = paramText;
@@ -665,6 +914,7 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
     // unordered "Module N:" list with no fixed VAE index. Remember the first;
     // used only as a fallback, so a real "VAE:" key always wins.
     std::wstring moduleVaeCandidate;
+    std::string loraHashNames; // one per line
     if (!paramsLine.empty()) {
         // "Lora hashes" is itself a quoted comma-separated sub-list, so a
         // plain find(", ") would split inside the quotes and truncate it.
@@ -707,17 +957,17 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
                 std::string v = paramsLine.substr(vStart, vEnd - vStart);
 
                 if (keyIs("Steps")) {
-                    info.steps = atoi(v.c_str());
+                    info.steps = AImgDecoderInternal::ParseLeadingInt(v.c_str());
                     info.has_steps = true;
                 } else if (keyIs("Sampler")) {
                     info.sampler = Utf8ToWstring(v);
                 } else if (keyIs("Schedule type") || keyIs("Scheduler")) {
                     info.scheduler = Utf8ToWstring(v);
                 } else if (keyIs("CFG scale")) {
-                    info.cfg_scale = atof(v.c_str());
+                    info.cfg_scale = AImgDecoderInternal::ParseLeadingDouble(v.c_str());
                     info.has_cfg = true;
                 } else if (keyIs("Seed")) {
-                    info.seed = _strtoui64(v.c_str(), NULL, 10);
+                    info.seed = AImgDecoderInternal::ParseLeadingUInt64(v.c_str());
                     info.has_seed = true;
                 } else if (keyIs("Size")) {
                     info.size = Utf8ToWstring(v);
@@ -726,21 +976,23 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
                 } else if (keyIs("Model hash")) {
                     info.model_hash = Utf8ToWstring(v);
                 } else if (keyIs("Clip skip")) {
-                    info.clip_skip = atoi(v.c_str());
+                    info.clip_skip = AImgDecoderInternal::ParseLeadingInt(v.c_str());
                     info.has_clip_skip = true;
                 } else if (keyIs("Denoising strength")) {
-                    info.denoising_strength = atof(v.c_str());
+                    info.denoising_strength = AImgDecoderInternal::ParseLeadingDouble(v.c_str());
                     info.has_denoising_strength = true;
                 } else if (keyIs("Hires upscale")) {
                     info.hires_upscale = Utf8ToWstring(v);
                 } else if (keyIs("Hires upscaler")) {
                     info.hires_upscaler = Utf8ToWstring(v);
                 } else if (keyIs("Hires steps")) {
-                    info.hires_steps = atoi(v.c_str());
+                    info.hires_steps = AImgDecoderInternal::ParseLeadingInt(v.c_str());
                     info.has_hires_steps = true;
                 } else if (keyIs("VAE")) {
                     info.vae = Utf8ToWstring(v);
-                } else if (keyIs("Lora hashes") || keyIs("Loras")) {
+                } else if (keyIs("Lora hashes")) {
+                    LoraNamesFromHashList(v, loraHashNames);
+                } else if (keyIs("Loras")) {
                     info.lora = Utf8ToWstring(v);
                 } else if (keyIs("Civitai resources")) {
                     civitaiResources = v;
@@ -753,34 +1005,64 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
                     if ((v.size() > 1 && v[0] == 'f' && isdigit((unsigned char)v[1])) ||
                         v.rfind("neo", 0) == 0) {
                         info.generator = L"Forge";
+                    } else if (v.size() == 7 &&
+                               std::equal(v.begin(), v.end(), "ComfyUI",
+                                          [](char a, char b) { return tolower((unsigned char)a) == tolower((unsigned char)b); })) {
+                        // ComfyUI save nodes writing A1111-style text name
+                        // themselves here; trust it over the generic label.
+                        info.generator = L"ComfyUI";
+                        isComfyUIVersionBlock = true;
                     }
                 }
             }
             start = nextComma + 2;
         }
     }
+    // Only split when no explicit scheduler key was present.
+    if (isComfyUIVersionBlock && info.scheduler.empty()) {
+        SplitComfyUISamplerScheduler(info.sampler, info.scheduler);
+    }
+    // Same duplicated-negative artifact as the companion drop in DecodeCore:
+    // a negative identical to the prompt is not a real negative.
+    if (isComfyUIVersionBlock && !info.negative_prompt.empty()) {
+        static const wchar_t* kWs = L" \t\r\n";
+        const std::wstring& n = info.negative_prompt;
+        const std::wstring& p = info.prompt;
+        size_t nb = n.find_first_not_of(kWs);
+        size_t pb = p.find_first_not_of(kWs);
+        if (nb != std::wstring::npos && pb != std::wstring::npos) {
+            size_t nl = n.find_last_not_of(kWs) - nb + 1;
+            size_t pl = p.find_last_not_of(kWs) - pb + 1;
+            if (nl == pl && n.compare(nb, nl, p, pb, pl) == 0) {
+                info.negative_prompt.clear();
+            }
+        }
+    }
     if (info.vae.empty() && !moduleVaeCandidate.empty()) {
         info.vae = moduleVaeCandidate;
     }
 
-    // Only when "Lora hashes"/"Loras" left info.lora empty; those are the
-    // real A1111 convention and win when present.
-    if (info.lora.empty() && !hashesJson.empty()) {
+    // Only when "Lora hashes"/"Loras" left nothing; those are the real
+    // A1111 convention and win when present.
+    if (info.lora.empty() && loraHashNames.empty() && !hashesJson.empty()) {
         SimpleJson::JsonParser parser(hashesJson);
         auto root = parser.parse();
         if (root && root->type == SimpleJson::JsonType::Object) {
-            std::string joined;
             for (const auto& kv : root->objVal) {
                 if (kv.first.rfind("LORA:", 0) != 0) continue;
-                std::string name = kv.first.substr(5);
-                std::string hash = (kv.second && kv.second->type == SimpleJson::JsonType::String) ? kv.second->strVal : "";
-                if (!joined.empty()) joined += ", ";
-                joined += name;
-                if (!hash.empty()) joined += ": " + hash;
+                loraHashNames.append(kv.first, 5, std::string::npos);
+                loraHashNames += '\n';
             }
-            if (!joined.empty()) info.lora = Utf8ToWstring(joined);
         }
     }
+
+    // Weights come from the prompt's tags; see BuildLoraList. A JSON-shaped
+    // "prompt" (a graph chunk reaching here as companion text) is not
+    // scanned: its <lora:> strings sit in arbitrary widgets.
+    size_t firstNonWs = posPrompt.find_first_not_of(" \t\r\n");
+    bool promptIsJson = firstNonWs != std::string::npos && (posPrompt[firstNonWs] == '{' || posPrompt[firstNonWs] == '[');
+    std::string loraList = BuildLoraList(promptIsJson ? std::string() : posPrompt, loraHashNames, !info.lora.empty());
+    if (!loraList.empty()) info.lora = Utf8ToWstring(loraList);
 
     // Some online generators omit "Model:" entirely and log a resources
     // array of {type, modelVersionId, modelName} instead; recover the
@@ -872,10 +1154,202 @@ bool AImgDecoder::DecodeEasyDiffusion(const SimpleJson::JsonValue* root, const s
 // Declared in aimg_decoder_internal.h, defined here next to its other
 // caller: comfyui_decoder.cpp formats its LoRA weights with the same helper.
 namespace AImgDecoderInternal {
+std::string FormatFixed(double v, int prec) {
+    uint64_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    bool neg = (bits >> 63) != 0;
+    int expBits = (int)((bits >> 52) & 0x7FF);
+    uint64_t frac = bits & ((1ULL << 52) - 1);
+    if (expBits == 0x7FF) return frac ? std::string("nan") : std::string(neg ? "-inf" : "inf");
+    if (prec < 0) prec = 0;
+    if (prec > 6) prec = 6;
+    uint64_t pow10 = 1;
+    for (int i = 0; i < prec; i++) pow10 *= 10;
+
+    // |v| = m * 2^e exactly. Splitting it into integer part I and a fraction
+    // fracNum / 2^k keeps every intermediate within 128 bits (fracNum < 2^53
+    // and 10^prec < 2^20), which is what lets the rounding decision be exact
+    // instead of depending on v * 10^prec being representable.
+    uint64_t m = expBits ? (frac | (1ULL << 52)) : frac;
+    int e = (expBits ? expBits : 1) - 1075;
+    uint64_t intPart = 0, fracQ = 0;
+    if (e >= 0) {
+        intPart = e > 10 ? 0x7FFFFFFFFFFFFFFFULL : (m << e);
+    } else {
+        int k = -e;
+        uint64_t fracNum;
+        if (k >= 53) {
+            fracNum = m;
+        } else {
+            intPart = m >> k;
+            fracNum = m & ((1ULL << k) - 1);
+        }
+        // P = fracNum * 10^prec as a 128-bit value (hi:lo), built from two
+        // 32-bit halves so no 64x64->128 intrinsic is needed (x86 has none).
+        uint64_t a = (fracNum & 0xFFFFFFFFULL) * pow10;
+        uint64_t b = (fracNum >> 32) * pow10;
+        uint64_t lo = a + (b << 32);
+        uint64_t hi = (b >> 32) + (lo < a ? 1 : 0);
+        // P < 2^73, so for k >= 74 the fraction is below one half unit and
+        // the quotient is 0 (round down); only k <= 73 needs real shifting.
+        if (k <= 73 && (hi | lo) != 0) {
+            uint64_t remHi, remLo, halfHi, halfLo;
+            if (k < 64) {
+                fracQ = (lo >> k) | (hi << (64 - k));
+                remHi = 0;
+                remLo = lo & ((1ULL << k) - 1);
+            } else {
+                fracQ = hi >> (k - 64);
+                remHi = (k == 64) ? 0 : (hi & ((1ULL << (k - 64)) - 1));
+                remLo = lo;
+            }
+            if (k - 1 < 64) { halfHi = 0; halfLo = 1ULL << (k - 1); }
+            else { halfHi = 1ULL << (k - 1 - 64); halfLo = 0; }
+            bool greater = remHi > halfHi || (remHi == halfHi && remLo > halfLo);
+            bool tie = remHi == halfHi && remLo == halfLo;
+            // Exact ties round half to even on the last printed digit, as the
+            // UCRT's printf does.
+
+            if (greater || (tie && (((prec > 0 ? fracQ : intPart) & 1) != 0))) fracQ++;
+        }
+        if (fracQ >= pow10) { fracQ -= pow10; intPart++; }
+    }
+
+    std::string out;
+    if (neg) out += '-';
+    out += std::to_string(intPart);
+    if (prec > 0) {
+        out += '.';
+        std::string f = std::to_string(fracQ);
+        out.append((size_t)prec - f.size(), '0');
+        out += f;
+    }
+    return out;
+}
+
+bool ParseDouble(const char* s, const char** end, double& out) {
+    const char* p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f') p++;
+    bool neg = false;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+
+    // At most 19 significant digits fit a uint64; later integer digits only
+    // shift the exponent and later fraction digits are dropped.
+    uint64_t mant = 0;
+    int sigDigits = 0, exp10 = 0, digitCount = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        digitCount++;
+        if (sigDigits < 19) {
+            mant = mant * 10 + (uint64_t)(*p - '0');
+            if (mant) sigDigits++;
+        } else {
+            exp10++;
+        }
+    }
+    if (*p == '.') {
+        const char* q = p + 1;
+        for (; *q >= '0' && *q <= '9'; q++) {
+            digitCount++;
+            if (sigDigits < 19) {
+                mant = mant * 10 + (uint64_t)(*q - '0');
+                if (mant) sigDigits++;
+                exp10--;
+            }
+        }
+        // "5." is a number, "." alone is not: the dot is consumed only when a
+        // digit exists on either side, same as strtod.
+        if (digitCount > 0) p = q;
+    }
+    if (digitCount == 0) { *end = s; out = 0.0; return false; }
+
+    if (*p == 'e' || *p == 'E') {
+        const char* q = p + 1;
+        bool eneg = false;
+        if (*q == '+' || *q == '-') { eneg = (*q == '-'); q++; }
+        if (*q >= '0' && *q <= '9') {
+            int ev = 0;
+            for (; *q >= '0' && *q <= '9'; q++) {
+                if (ev < 100000) ev = ev * 10 + (*q - '0');
+            }
+            exp10 += eneg ? -ev : ev;
+            p = q;
+        }
+    }
+    *end = p;
+
+    double d = (double)mant;
+    if (mant != 0 && exp10 != 0) {
+        static const double kPow10[] = {
+            1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+            1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+        };
+        // Both the mantissa (< 2^53) and the power of ten (<= 1e22) are exact
+        // doubles here, so one multiply/divide is correctly rounded - the fast
+        // path that makes ordinary values bit-identical to strtod.
+        int ae = exp10 < 0 ? -exp10 : exp10;
+        if (mant < (1ULL << 53) && ae <= 22) {
+            d = exp10 < 0 ? d / kPow10[ae] : d * kPow10[ae];
+        } else {
+            while (ae > 22 && d != 0.0 && d <= 1.7e308) {
+                d = exp10 < 0 ? d / 1e22 : d * 1e22;
+                ae -= 22;
+            }
+            if (ae > 0) d = exp10 < 0 ? d / kPow10[ae] : d * kPow10[ae];
+        }
+    }
+    out = neg ? -d : d;
+    return true;
+}
+
+double ParseLeadingDouble(const char* s) {
+    const char* end;
+    double d;
+    return ParseDouble(s, &end, d) ? d : 0.0;
+}
+
+int ParseLeadingInt(const char* s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\v' || *s == '\f') s++;
+    bool neg = false;
+    if (*s == '+' || *s == '-') { neg = (*s == '-'); s++; }
+    int64_t v = 0;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        if (v < 100000000000LL) v = v * 10 + (*s - '0'); // saturates well past int range
+    }
+    if (neg) v = -v;
+    if (v > 2147483647LL) return 2147483647;
+    if (v < -2147483647LL - 1) return -2147483647 - 1;
+    return (int)v;
+}
+
+uint64_t ParseLeadingUInt64(const char* s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\v' || *s == '\f') s++;
+    bool neg = false;
+    if (*s == '+' || *s == '-') { neg = (*s == '-'); s++; }
+    uint64_t v = 0;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        uint64_t d = (uint64_t)(*s - '0');
+        if (v > (UINT64_MAX - d) / 10) return UINT64_MAX; // the CRT reports ERANGE and returns UINT64_MAX, sign ignored
+        v = v * 10 + d;
+    }
+    return neg ? (uint64_t)0 - v : v;
+}
+
+uint32_t ParseHexPrefix(const char* s) {
+    uint32_t v = 0;
+    for (;; s++) {
+        char c = *s;
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+    }
+    return v;
+}
+
 std::string FormatCompactNumber(double v) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f", v);
-    std::string s(buf);
+    std::string s = FormatFixed(v, 2);
     size_t dot = s.find('.');
     if (dot != std::string::npos) {
         size_t last = s.find_last_not_of('0');

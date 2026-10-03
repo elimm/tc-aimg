@@ -3,8 +3,9 @@
 
 // Implementation header shared by aimg_decoder.cpp and comfyui_decoder.cpp
 // only; aimg.cpp must not include it. SimpleJson::JsonParser deliberately
-// stays in aimg_decoder.cpp -- comfyui_decoder.cpp never uses it, so putting
-// it here would make both files pay for it.
+// stays in aimg_decoder.cpp -- comfyui_decoder.cpp reaches it only through
+// the ParseJson wrapper below, so putting it here would make both files pay
+// for it.
 
 #include <cstdint>
 #include <cmath>
@@ -88,6 +89,30 @@ struct JsonValue {
 // than global so it can't silently collide at file scope in either.
 namespace AImgDecoderInternal {
 std::string FormatCompactNumber(double v);
+
+// Own number parsing/formatting instead of strtod/atof/atoi/strtoul/printf,
+// which pull the CRT's locale-aware conversion engines into the /MT build.
+// Deviation: inf/nan/hex-float spellings do not parse as numbers.
+//
+// strtod-compatible subset; false with *end == s when no digit was consumed.
+// Bit-identical to strtod when the significand fits 2^53 and the decimal
+// exponent is within +-22, otherwise within a few ulp.
+bool ParseDouble(const char* s, const char** end, double& out);
+// atof semantics: 0.0 when nothing parses.
+double ParseLeadingDouble(const char* s);
+// atoi semantics, but out-of-range clamps instead of being undefined.
+int ParseLeadingInt(const char* s);
+// _strtoui64(s, NULL, 10) semantics; overflow saturates to UINT64_MAX.
+uint64_t ParseLeadingUInt64(const char* s);
+// strtoul(s, NULL, 16) over the 4 hex digits of a JSON \u escape.
+uint32_t ParseHexPrefix(const char* s);
+// Identical to snprintf("%.*f", prec, v) for finite |v| < 2^63, prec 0..6,
+// ties included; |v| >= 2^63 saturates the integer part.
+std::string FormatFixed(double v, int prec);
+
+// Parses a JSON value nested inside an already-parsed tree (a field holding
+// a JSON-encoded string). nullptr on anything that doesn't parse.
+std::unique_ptr<SimpleJson::JsonValue> ParseJson(const std::string& text);
 } // namespace AImgDecoderInternal
 
 #endif // AIMG_DECODER_INTERNAL_H

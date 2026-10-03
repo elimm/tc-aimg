@@ -5,7 +5,6 @@
 #include "aimg_abort.h"
 #include <windows.h>
 #include <string>
-#include <mutex>
 #include <algorithm>
 #include <cassert>
 #include <deque>
@@ -47,7 +46,22 @@ static const size_t kCacheCapacity = 4;
 // inside the window -- fine for interactive column queries.
 static const ULONGLONG kStatDebounceMs = 200;
 
-static std::mutex g_CacheMutex;
+// SRWLOCK instead of std::mutex: in the /MT build std::mutex drags in
+// std::system_error/FormatMessageA (~10 KB) for what is just an exclusive lock.
+struct SrwLock {
+    SRWLOCK l = SRWLOCK_INIT;
+    void lock() { AcquireSRWLockExclusive(&l); }
+    void unlock() { ReleaseSRWLockExclusive(&l); }
+};
+struct SrwGuard {
+    SrwLock& m;
+    explicit SrwGuard(SrwLock& lk) : m(lk) { m.lock(); }
+    ~SrwGuard() { m.unlock(); }
+    SrwGuard(const SrwGuard&) = delete;
+    SrwGuard& operator=(const SrwGuard&) = delete;
+};
+
+static SrwLock g_CacheMutex;
 static std::deque<CacheEntry> g_Cache; // front = most recently used
 
 // Existence + staleness stamp from one attribute query, no file handle.
@@ -155,7 +169,7 @@ static bool LooksSlow(const std::wstring& filePath, const ULARGE_INTEGER& fileSi
 // path. Guarded by its OWN mutex, never g_CacheMutex: a stop request must
 // not be able to block on, or deadlock against, a parse that is itself
 // waiting on the cache lock.
-static std::mutex g_InFlightMutex;
+static SrwLock g_InFlightMutex;
 // Flat vector with a linear scan, not a std::map: at most a handful of
 // parses are ever in flight, and a wstring-keyed tree instantiates a whole
 // map specialization to search ~2 elements.
@@ -431,7 +445,7 @@ static int GetValueWImpl(WCHAR* FileName, int FieldIndex, int UnitIndex, void* F
     // A cached file is never delayed, whatever flags TC passes: answering
     // from the cache is not slow by any definition this policy cares about.
     {
-        std::lock_guard<std::mutex> lock(g_CacheMutex);
+        SrwGuard lock(g_CacheMutex);
         if (FindFresh(filePath)) {
             return ExtractField(FieldIndex, g_Cache.front(), UnitIndex, FieldValue, maxlen);
         }
@@ -462,7 +476,7 @@ static int GetValueWImpl(WCHAR* FileName, int FieldIndex, int UnitIndex, void* F
     auto abortFlag = std::make_shared<std::atomic<bool>>(false);
     std::wstring inFlightKey = ToLowerPathKey(filePath);
     {
-        std::lock_guard<std::mutex> lock(g_InFlightMutex);
+        SrwGuard lock(g_InFlightMutex);
         g_InFlight.emplace_back(inFlightKey, abortFlag);
     }
     AbortFlagSlot() = abortFlag.get();
@@ -475,7 +489,7 @@ static int GetValueWImpl(WCHAR* FileName, int FieldIndex, int UnitIndex, void* F
         std::wstring key;
         std::shared_ptr<std::atomic<bool>> flag;
         ~InFlightGuard() {
-            std::lock_guard<std::mutex> lock(g_InFlightMutex);
+            SrwGuard lock(g_InFlightMutex);
             for (auto it = g_InFlight.begin(); it != g_InFlight.end(); ++it) {
                 if (it->first == key && it->second.get() == flag.get()) { g_InFlight.erase(it); break; }
             }
@@ -514,7 +528,7 @@ static int GetValueWImpl(WCHAR* FileName, int FieldIndex, int UnitIndex, void* F
     entry.fileSize = size;
     entry.lastStatTick = statTick;
 
-    std::lock_guard<std::mutex> lock(g_CacheMutex);
+    SrwGuard lock(g_CacheMutex);
     // Another thread may have inserted this path while this one parsed with
     // no lock held. Either result is fine -- both came from the same bytes.
     // That duplicated parse is the accepted cost of not serializing every
@@ -597,7 +611,7 @@ void __stdcall ContentSendStateInformationW(int state, WCHAR* path) {
 void __stdcall ContentStopGetValueW(WCHAR* FileName) {
     if (!FileName) return;
     std::wstring key = ToLowerPathKey(FileName);
-    std::lock_guard<std::mutex> lock(g_InFlightMutex);
+    SrwGuard lock(g_InFlightMutex);
     // EVERY entry for this path, not just the first: duplicate keys are
     // legal and TC gives no way to say which parse it means.
     for (auto& kv : g_InFlight) {

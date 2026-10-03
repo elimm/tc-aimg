@@ -8,21 +8,31 @@
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <climits>
+
+// Plain decimal digits only (no whitespace or sign): std::stol pulled the
+// CRT's locale-aware conversion and exception machinery into the DLL, and
+// every decoder writes a bare "WxH". Values above LONG_MAX are rejected.
+inline bool ParseSizeSide(const std::wstring& s, size_t from, size_t to, long& out) {
+    if (from >= to) return false;
+    long v = 0;
+    for (size_t i = from; i < to; i++) {
+        if (s[i] < L'0' || s[i] > L'9') return false;
+        int d = s[i] - L'0';
+        if (v > (LONG_MAX - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    out = v;
+    return true;
+}
 
 // Parses the "Size" field's "WxH" shape. False on empty, malformed, or
 // zero/negative dimensions.
 inline bool ParseSize(const std::wstring& size, long& w, long& h) {
     size_t xPos = size.find(L'x');
     if (xPos == std::wstring::npos) return false;
-    try {
-        size_t wEnd = 0, hEnd = 0;
-        w = std::stol(size.substr(0, xPos), &wEnd);
-        h = std::stol(size.substr(xPos + 1), &hEnd);
-        if (wEnd != xPos) return false; // trailing junk before 'x'
-        if (xPos + 1 + hEnd != size.size()) return false; // trailing junk after height
-    } catch (...) {
-        return false;
-    }
+    if (!ParseSizeSide(size, 0, xPos, w)) return false;
+    if (!ParseSizeSide(size, xPos + 1, size.size(), h)) return false;
     return w > 0 && h > 0;
 }
 
