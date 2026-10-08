@@ -21,7 +21,7 @@ endif()
 # Keep this VERSION in sync with src/aimg_version.h (AIMG_VERSION_MAJOR/MINOR/
 # PATCH) and pluginst.inf's `version=` key -- not consumed by the build itself,
 # just kept aligned by hand for consistency.
-project(aimg VERSION 0.3.0 LANGUAGES CXX C RC)
+project(aimg VERSION 0.3.1 LANGUAGES CXX C RC)
 
 # Multi-config generators ignore CMAKE_BUILD_TYPE and hardcode Debug when
 # `cmake --build .` is given no --config. Offering only Release turns that
