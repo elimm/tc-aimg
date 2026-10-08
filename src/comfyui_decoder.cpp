@@ -2,6 +2,7 @@
 #include "aimg_decoder_internal.h"
 #include "aimg_abort.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <emmintrin.h>
 #include <cstdio>
@@ -46,6 +47,13 @@ namespace {
 using SimpleJson::JsonType;
 using SimpleJson::JsonValue;
 using SimpleJson::ClampDoubleToInt64;
+
+// A raw (int) cast of an out-of-range or NaN double is UB; -1 is the
+// "unknown slot" value every consumer already rejects.
+int JsonSlotIndex(const JsonValue* v) {
+    if (!v || v->type != JsonType::Number) return -1;
+    return (v->numVal >= 0 && v->numVal <= INT_MAX) ? (int)v->numVal : -1;
+}
 
 // Node/link ids are a JSON number or string depending on export version;
 // normalize to the string form every lookup here keys on.
@@ -96,21 +104,30 @@ bool IsLoaderHeldPromptClass(const std::string& c) {
            c.find("easy fullLoader") != std::string::npos;
 }
 
-// Guards the UI-format LoRA collector's positional fallback: a node whose
-// type merely CONTAINS "Lora" (a save node, not a loader) can still have a
-// String first widget -- a filename-prefix template, not a LoRA name. Also
-// guards loader-held ckpt_name reads, which can hold a cosmetic placeholder.
-bool LooksLikeModelFileName(const std::string& s) {
+// Length of the model-file extension s ends in, 0 when none. One list serves
+// both the "is this a model file" test and the extension strip. The test
+// guards the UI-format LoRA collector's positional fallback (a node whose type
+// merely CONTAINS "Lora" can hold a filename-prefix template) and loader-held
+// ckpt_name reads, which can hold a cosmetic placeholder.
+size_t ModelFileExtensionLength(const std::string& s) {
     static const char* const kExtensions[] = {".safetensors", ".ckpt", ".gguf", ".pt", ".pth", ".bin", ".sft"};
     for (const char* ext : kExtensions) {
         size_t extLen = strlen(ext);
         if (s.size() < extLen) continue;
         if (std::equal(s.end() - extLen, s.end(), ext, ext + extLen,
                         [](char a, char b) { return tolower((unsigned char)a) == tolower((unsigned char)b); })) {
-            return true;
+            return extLen;
         }
     }
-    return false;
+    return 0;
+}
+
+bool LooksLikeModelFileName(const std::string& s) {
+    return ModelFileExtensionLength(s) != 0;
+}
+
+std::string StripModelFileExtension(const std::string& s) {
+    return s.substr(0, s.size() - ModelFileExtensionLength(s));
 }
 
 // A graph link is a 2-element array [node_id, output_slot].
@@ -576,8 +593,10 @@ std::string ResolveOrexClipTextEncode(const JsonValue* nodesObj, const JsonValue
         if (n > maxN) maxN = n;
     }
     std::string joined;
-    for (int i = 0; i <= maxN; i++) {
-        const JsonValue* f = i ? refInputs->find(("string" + std::to_string(i)).c_str()) : refInputs->find("text");
+    // 1..maxN are the numbered strings; the final pass (i == maxN + 1) is the
+    // node's own "text", which the real node appends last.
+    for (int i = 1; i <= maxN + 1; i++) {
+        const JsonValue* f = i <= maxN ? refInputs->find(("string" + std::to_string(i)).c_str()) : refInputs->find("text");
         if (!f) continue;
         std::string val = TrimWs(ResolveTextField(nodesObj, f, nullptr, depth + 1));
         if (val.empty()) continue;
@@ -1010,9 +1029,9 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
                 if (l->arrVal.size() < 2 || !l->arrVal[0] || l->arrVal[0]->type != JsonType::Number || !l->arrVal[1]) continue;
                 linkId = ClampDoubleToInt64(l->arrVal[0]->numVal);
                 originId = JsonIdToString(l->arrVal[1].get());
-                if (l->arrVal.size() > 2 && l->arrVal[2] && l->arrVal[2]->type == JsonType::Number) originSlot = (int)l->arrVal[2]->numVal;
+                if (l->arrVal.size() > 2) originSlot = JsonSlotIndex(l->arrVal[2].get());
                 if (l->arrVal.size() > 3 && l->arrVal[3]) targetId = JsonIdToString(l->arrVal[3].get());
-                if (l->arrVal.size() > 4 && l->arrVal[4] && l->arrVal[4]->type == JsonType::Number) targetSlot = (int)l->arrVal[4]->numVal;
+                if (l->arrVal.size() > 4) targetSlot = JsonSlotIndex(l->arrVal[4].get());
             } else if (l->type == JsonType::Object) {
                 // Subgraph-capable versions store each link as an object
                 // instead. Unhandled, every link in such a workflow is
@@ -1022,13 +1041,9 @@ void CollectUiNodesAndLinks(const JsonValue* scope, const std::string& scopeId, 
                 if (!idv || idv->type != JsonType::Number || !originv) continue;
                 linkId = ClampDoubleToInt64(idv->numVal);
                 originId = JsonIdToString(originv);
-                if (const JsonValue* originSlotField = l->find("origin_slot")) {
-                    if (originSlotField->type == JsonType::Number) originSlot = (int)originSlotField->numVal;
-                }
+                originSlot = JsonSlotIndex(l->find("origin_slot"));
                 if (const JsonValue* targetIdField = l->find("target_id")) targetId = JsonIdToString(targetIdField);
-                if (const JsonValue* targetSlotField = l->find("target_slot")) {
-                    if (targetSlotField->type == JsonType::Number) targetSlot = (int)targetSlotField->numVal;
-                }
+                targetSlot = JsonSlotIndex(l->find("target_slot"));
             } else {
                 continue;
             }
@@ -1536,8 +1551,7 @@ bool IsNodeDisabled(const JsonValue* node) {
     if (!node || node->type != JsonType::Object) return false;
     const JsonValue* m = node->find("mode");
     if (!m || m->type != JsonType::Number) return false;
-    int mode = (int)m->numVal;
-    return mode == 2 || mode == 4;
+    return m->numVal == 2 || m->numVal == 4;
 }
 
 // Traversal of one "nodes" array -- the top-level one, or a subgraph
@@ -1974,6 +1988,42 @@ std::set<std::string> ComputeExtractionScope(const JsonValue* nodesObj, const st
     return scope;
 }
 
+// Follows the primary sampler's "model" link (through LoRA stacks, patchers and
+// samplers-of-model nodes alike, whatever their class names) to the node that
+// has no model input of its own and reads the checkpoint name there. A custom
+// sampler reaches its model through a guider instead. The terminal's name is
+// accepted only when it looks like a model file, so a loader of some other
+// kind (an upscale model, a placeholder string) is never reported as the model.
+std::string ModelFromPrimaryChain(const JsonValue* nodesObj, const JsonValue* primaryInputs) {
+    if (!primaryInputs) return "";
+    std::string cur = GetLinkNodeId(primaryInputs->find("model"));
+    if (cur.empty()) {
+        std::string guiderId = GetLinkNodeId(primaryInputs->find("guider"));
+        auto git = guiderId.empty() ? nodesObj->objVal.end() : nodesObj->objVal.find(guiderId);
+        if (git != nodesObj->objVal.end() && git->second && git->second->type == JsonType::Object) {
+            if (const JsonValue* gin = git->second->getObj("inputs")) cur = GetLinkNodeId(gin->find("model"));
+        }
+    }
+    // The hop bound alone also ends a cycle.
+    for (int hop = 0; hop < 32 && !cur.empty(); hop++) {
+        auto it = nodesObj->objVal.find(cur);
+        if (it == nodesObj->objVal.end() || !it->second || it->second->type != JsonType::Object) return "";
+        const JsonValue* in = it->second->getObj("inputs");
+        if (!in) return "";
+        std::string next = GetLinkNodeId(in->find("model"));
+        if (!next.empty()) { cur = std::move(next); continue; }
+        static const char* const kKeys[] = {"ckpt_name", "unet_name", "model_name", "gguf_name"};
+        for (const char* key : kKeys) {
+            const JsonValue* v = in->find(key);
+            if (!v) continue;
+            std::string resolved = ResolveTextField(nodesObj, v, key);
+            return LooksLikeModelFileName(resolved) ? resolved : std::string();
+        }
+        return "";
+    }
+    return "";
+}
+
 // active == false means no scoping: every node is processed.
 struct ApiScopeInfo {
     bool active = false;
@@ -2012,7 +2062,7 @@ ApiScopeInfo ComputeApiScope(const JsonValue* nodesObj) {
 
 } // namespace
 
-bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
+bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info, bool* outNegativeZeroed) {
     if (!root || root->type != SimpleJson::JsonType::Object) return false;
 
     // Every other decoder gates on a distinctive key before touching the
@@ -2053,6 +2103,9 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     // stays documented incidental behaviour rather than a guessed heuristic.
     std::string positiveNodeId, negativeNodeId;
     std::string guessPosNodeId; // which node the encounter-order Prompt guess came from
+    // The node that supplied positiveNodeId has no "negative" input at all
+    // (a BasicGuider), as opposed to one whose negative link did not resolve.
+    bool posSourceLacksNegative = false;
     ComfyUiExtraction ui;
 
     // Computed once up front, so the loop's per-node check is one lookup.
@@ -2153,6 +2206,7 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                     // "conditioning"; it has no negative side.
                     if (const auto* v2 = inputs->find("conditioning")) positiveNodeId = GetLinkNodeId(v2);
                 }
+                if (!positiveNodeId.empty()) posSourceLacksNegative = (inputs->find("negative") == nullptr);
             }
             if (negativeNodeId.empty()) {
                 if (const auto* v = inputs->find("negative")) negativeNodeId = GetLinkNodeId(v);
@@ -2292,9 +2346,9 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             // invisible to every "lora_N" shape above. Its "text" widget also
             // carries a tag for EVERY entry regardless of "active", so
             // reading that instead would overcount: use the structured array
-            // and keep only active ones. "strength" is inconsistently typed
-            // within one real file, so accept a Number or a numeric String
-            // rather than silently reading 0.
+            // and keep only entries with an explicit boolean active:true.
+            // "strength" is inconsistently typed within one real file, so
+            // accept a Number or a numeric String rather than silently reading 0.
             const JsonValue* valueArr = nullptr;
             if (const auto* lorasField = inputs->find("loras")) {
                 if (lorasField->type == JsonType::Object) valueArr = lorasField->find("__value__");
@@ -2489,13 +2543,43 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
 
     // The exact wired nodes beat the "first/second found" guess above, which
     // is unreliable once a graph has more than two text-encode nodes.
+    // With no sampler in scope, a saver-like node wiring both prompts in as
+    // links names the roles itself; the encounter-order guess swaps them
+    // whenever the negative's node id sorts first. Only links count: string
+    // literals there are placeholders.
+    if (positiveNodeId.empty() && negativeNodeId.empty()) {
+        for (const auto& pair : nodesObj->objVal) {
+            if (AbortRequested()) break;
+            if (apiScope.active && !apiScope.scope.count(pair.first)) continue;
+            if (!pair.second || pair.second->type != JsonType::Object) continue;
+            const JsonValue* in = pair.second->getObj("inputs");
+            if (!in) continue;
+            const JsonValue* posLink = in->find("positive");
+            const JsonValue* negLink = in->find("negative");
+            if (GetLinkNodeId(posLink).empty() || GetLinkNodeId(negLink).empty()) continue;
+            // ResolveTextField follows the link through an encoder's own "text"
+            // as well as a plain string node's "value".
+            std::string pos = ResolveTextField(nodesObj, posLink);
+            std::string neg = ResolveTextField(nodesObj, negLink);
+            if (!pos.empty()) {
+                ui.posPromptText = std::move(pos);
+                ui.negPromptText = std::move(neg);
+            }
+            break;
+        }
+    }
+
     std::string resolvedPos = ResolveClipText(nodesObj, positiveNodeId, /*isPositive=*/true);
     std::string resolvedNeg = ResolveClipText(nodesObj, negativeNodeId, /*isPositive=*/false);
     if (!resolvedPos.empty()) ui.posPromptText = resolvedPos;
     if (!resolvedNeg.empty()) ui.negPromptText = resolvedNeg;
     // A deliberately zeroed negative stays blank: the encounter-order guess
     // would otherwise refill it with the text the zeroed conditioning came from.
-    if (resolvedNeg.empty() && IsZeroedConditioning(nodesObj, negativeNodeId)) ui.negPromptText.clear();
+    // So does a negative the positive's source has no input for (BasicGuider);
+    // one that merely failed to resolve may still be companion-filled.
+    const bool negAbsent = apiScope.active && !positiveNodeId.empty() && negativeNodeId.empty() && posSourceLacksNegative;
+    const bool negZeroed = resolvedNeg.empty() && (IsZeroedConditioning(nodesObj, negativeNodeId) || negAbsent);
+    if (negZeroed) ui.negPromptText.clear();
     // A positive computed at run time resolves empty, and the encounter-order
     // guess may then hold the NEGATIVE text. Leave it blank instead, so a
     // companion text block can fill it.
@@ -2642,6 +2726,43 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             if (found) { product *= n; anyResolved = true; }
         }
         if (anyResolved) local.hires_upscale = Utf8ToWstring(FormatCompactNumber(product));
+
+        // Upscale models used by a pass layered on top of the primary one:
+        // a literal file name or a link to a loader's model_name. Listed in
+        // pipeline order (fewer ancestors = earlier), each name once.
+        struct UpscalerUse { size_t depth; std::string name; };
+        std::vector<UpscalerUse> upscalers;
+        for (const auto& id : apiScope.rootAncestors) {
+            if (AbortRequested()) break;
+            if (id == apiScope.primary || apiScope.primaryAncestors.count(id)) continue;
+            auto upIt = nodesObj->objVal.find(id);
+            if (upIt == nodesObj->objVal.end() || !upIt->second || upIt->second->type != JsonType::Object) continue;
+            const auto* upInputs = upIt->second->getObj("inputs");
+            if (!upInputs) continue;
+            const JsonValue* v = upInputs->find("upscale_model");
+            if (!v) v = upInputs->find("upscale_model_opt");
+            if (!v) continue;
+            std::string name = (v->type == JsonType::String) ? v->strVal : ResolveTextField(nodesObj, v, "model_name");
+            name = StripModelFileExtension(TrimWs(name));
+            if (name.empty()) continue;
+            upscalers.push_back({ComputeAncestors(nodesObj, id).size(), std::move(name)});
+        }
+        // Selection by smallest depth rather than std::sort: a handful of
+        // entries, and the sort instantiation alone costs kilobytes. Ties keep
+        // rootAncestors' (node id) order. A name already listed is skipped.
+        std::string upscalerList;
+        std::vector<std::string> listed;
+        while (!upscalers.empty()) {
+            size_t best = 0;
+            for (size_t i = 1; i < upscalers.size(); i++) if (upscalers[i].depth < upscalers[best].depth) best = i;
+            std::string name = std::move(upscalers[best].name);
+            upscalers.erase(upscalers.begin() + best);
+            if (std::find(listed.begin(), listed.end(), name) != listed.end()) continue;
+            if (!upscalerList.empty()) upscalerList += ", ";
+            upscalerList += name;
+            listed.push_back(std::move(name));
+        }
+        if (!upscalerList.empty()) local.hires_upscaler = Utf8ToWstring(upscalerList);
     }
 
     // Loader-held values by role: whatever the primary sampler's link lands
@@ -2655,6 +2776,10 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         if (const JsonValue* li = LoaderInputsLinkedFrom(nodesObj, primaryInputs, "model")) {
             std::string resolved = li->find("ckpt_name") ? ResolveTextField(nodesObj, li->find("ckpt_name"), "ckpt_name") : "";
             if (LooksLikeModelFileName(resolved)) ui.modelName = std::move(resolved);
+        }
+        if (ui.modelName.empty()) {
+            std::string chained = ModelFromPrimaryChain(nodesObj, primaryInputs);
+            if (!chained.empty()) ui.modelName = std::move(chained);
         }
         // Noise providers other than RandomNoise (an AdvancedNoise fed by a
         // seed node, a pack's own noise class) are not sampler-family, so the
@@ -2684,6 +2809,11 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         }
     }
 
+    // A join of partly run-time-computed parts can resolve to nothing but
+    // whitespace or separators (a lone " " literal); that is not a prompt, and
+    // non-empty it would stop the companion text from filling the real one.
+    ui.posPromptText = DropIfNoAlnum(std::move(ui.posPromptText));
+    ui.negPromptText = DropIfNoAlnum(std::move(ui.negPromptText));
     local.prompt = Utf8ToWstring(ui.posPromptText);
     local.negative_prompt = Utf8ToWstring(ui.negPromptText);
     local.model = Utf8ToWstring(ui.modelName);
@@ -2704,6 +2834,7 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     local.full_parameters_utf8 = originalText;
 
     // Confirmed a ComfyUI graph: only now commit to the caller.
+    if (outNegativeZeroed) *outNegativeZeroed = negZeroed;
     info = std::move(local);
     return true;
 }

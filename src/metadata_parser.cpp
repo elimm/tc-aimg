@@ -843,6 +843,26 @@ bool MetadataParser::ParseEXIF(const uint8_t* data, size_t size, RawImageMetadat
                     // No designator (cnt < 8 included): keep the value whole.
                     outMetadata.text_chunks["exif:UserComment"] = std::string((const char*)valPtr, cnt);
                 }
+            } else if ((tag == 0x010F || tag == 0x0110) && type == 2) {
+                // ComfyUI core's animated WebP/AVIF writer has no text chunk to
+                // use, so it stores its graphs in IFD0 Make as "workflow:{json}"
+                // and Model as "prompt:{json}". Any other Make/Model value is
+                // camera data and stays ignored.
+                static const struct { const char* label; size_t len; const char* key; } kGraphLabels[] = {
+                    {"prompt:", 7, "prompt"},
+                    {"workflow:", 9, "workflow"},
+                };
+                for (const auto& g : kGraphLabels) {
+                    if (cnt > g.len && memcmp(valPtr, g.label, g.len) == 0 && valPtr[g.len] == '{') {
+                        size_t n = cnt;
+                        while (n > g.len && valPtr[n - 1] == 0) n--;
+                        // Never overwrite a chunk of the same name (operator[]
+                        // rather than emplace: no new map instantiation).
+                        std::string& slot = outMetadata.text_chunks[g.key];
+                        if (slot.empty()) slot.assign((const char*)valPtr + g.len, n - g.len);
+                        break;
+                    }
+                }
             } else {
                 // Plain raw-text tags, all stored identically.
                 static const struct { uint16_t tag; const char* key; } kPlainTextTags[] = {

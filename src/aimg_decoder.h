@@ -21,7 +21,7 @@ private:
     static std::wstring NormalizeLoraField(const std::wstring& raw);
 
     static bool DecodeAutomatic1111(const std::string& paramText, AImgInfo& info, bool populateFullParameters = true);
-    static bool DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
+    static bool DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info, bool* outNegativeZeroed = nullptr);
     static bool DecodeEasyDiffusion(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
     static bool DecodeInvokeAI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
     static bool DecodeSwarmUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);

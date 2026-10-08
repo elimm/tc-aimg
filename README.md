@@ -21,7 +21,7 @@ Tested against **Automatic1111 WebUI**, **Easy Diffusion**, and **ComfyUI** (Com
   - **Automatic1111** (also covers **SD.Next** / **WebUI Forge**'s compatible parameter format, with Forge itself detected and labeled separately by version string) and **Easy Diffusion**: Extracts Positive Prompt, Negative Prompt, Steps, Sampler, Scheduler, CFG Scale, Seed, Model, Model Hash, Clip Skip, Denoising Strength, Hires Upscale parameters, VAE, and LoRA list.
   - **ComfyUI** *(best-effort)*: Parses execution graphs (`prompt`) and workflow JSON structure, including subgraphs with promoted widgets. Recursively traces KSampler nodes, CLIPTextEncode nodes, Checkpoint loaders, VAE loaders, LoRA loaders, and latent resolutions, with substring-based matching so many custom node packs are picked up too.
   - **Fooocus** *(untested)*: Extracts Fooocus prompt expansions, styles, samplers, base models, and refiners.
-  - **InvokeAI** *(untested)*: Extracts `invokeai_metadata` / `sd_metadata`.
+  - **InvokeAI** *(untested)*: Extracts `invokeai_metadata`.
   - **SwarmUI** *(untested)*: Extracts `sui_image_params`.
   - **NovelAI** *(untested)*: Extracts NovelAI Diffusion parameters and seeds.
   - **Draw Things** *(untested)*: Extracts its XMP-embedded generation record (prompt, seed, sampler, LoRAs, and more).
@@ -100,19 +100,19 @@ Each release ships two Total Commander auto-installer archives, both containing 
    - `[=aimg.Generator]`
    - `[=aimg.Model]`
    - `[=aimg.Seed]`
-   - `[=aimg.Prompt]`
+   - `[=aimg.Prompt (Short)]`
 4. Click **OK** to save.
 
 ### 2. Setting Up File Tooltips (Hover Info)
 1. Go to **Configuration** -> **Options** -> **Display** -> **Help texts**.
 2. Enable **Win32-style tips with file comments (if available)**.
-3. Custom tip rule for image extensions (`*.png;*.jpg;*.jpeg;*.webp;*.avif`):
+3. Custom tip rule for image extensions (`*.png;*.jpg;*.jpeg;*.webp;*.avif;*.tif;*.tiff`):
    ```
    Generator: [=aimg.Generator]
    Model: [=aimg.Model]
    Seed: [=aimg.Seed]
-   Prompt: [=aimg.Prompt]
-   Negative Prompt: [=aimg.Negative Prompt]
+   Prompt: [=aimg.Prompt (Short)]
+   Negative Prompt: [=aimg.Negative Prompt (Short)]
    ```
 
 ### 3. Searching for Specific Prompts or Seeds
@@ -129,7 +129,7 @@ Each release ships two Total Commander auto-installer archives, both containing 
 
 ## 🏗 Building from Source
 
-Requirements: Any modern C++17 compiler (MSVC, GCC/MinGW, or Clang) or CMake.
+Requirements: MSVC, GCC/MinGW or Clang, optionally with CMake. The easiest route is `build.bat`, which picks whichever of the three is installed; `build_msvc.bat` builds both bitnesses and the install zips.
 
 ### Build with CMake:
 ```bash
@@ -141,12 +141,14 @@ cmake --build . --config Release
 
 ### Build with MSVC:
 ```cmd
-cl /O2 /EHsc /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fe:aimg.wdx64 /link /DEF:src\aimg.def /MACHINE:X64
+rc /fo build\aimg.res /i src src\aimg.rc
+cl /W4 /WX /O2 /GL /Gy /GR- /EHsc /DUNICODE /D_UNICODE /DNDEBUG /MT /LD /I src src\metadata_parser.cpp src\aimg_decoder.cpp src\comfyui_decoder.cpp src\aimg.cpp /Fo"build\\" /Fe:build\aimg.wdx64 /link /DEF:src\aimg.def build\aimg.res /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF
 ```
 
 ### Build with MinGW / GCC:
 ```bash
-g++ -O3 -shared -I src src/metadata_parser.cpp src/aimg_decoder.cpp src/comfyui_decoder.cpp src/aimg.cpp src/aimg.def -o aimg.wdx64 -static
+windres -I src src/aimg.rc -O coff -o build/aimg.res.o
+g++ -Wall -O3 -flto -fno-rtti -ffunction-sections -fdata-sections -DUNICODE -D_UNICODE -DNDEBUG -shared -I src src/metadata_parser.cpp src/aimg_decoder.cpp src/comfyui_decoder.cpp src/aimg.cpp src/aimg.def build/aimg.res.o -o build/aimg.wdx64 -static -s -Wl,--gc-sections
 ```
 
 ---

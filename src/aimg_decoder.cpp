@@ -420,6 +420,20 @@ std::wstring AImgDecoder::NormalizeLoraField(const std::wstring& raw) {
     return result;
 }
 
+// SHA-256 of empty input: a save node that hashed no file at all writes (a
+// prefix of) this as "Model hash", which names no model.
+static bool IsEmptyInputSha256Prefix(const std::string& v) {
+    static const char kEmptySha256[] = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const size_t n = v.size();
+    if (n < 8 || n > sizeof(kEmptySha256) - 1) return false;
+    for (size_t i = 0; i < n; ++i) {
+        char c = v[i];
+        if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
+        if (c != kEmptySha256[i]) return false;
+    }
+    return true;
+}
+
 AImgInfo AImgDecoder::Decode(const RawImageMetadata& rawMeta) {
     AImgInfo info = DecodeCore(rawMeta);
     info.model = StripModelExtension(info.model);
@@ -582,7 +596,8 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
     for (auto* candPtr : comfyOrder) {
         auto& cand = *candPtr;
         SimpleJson::JsonValue* json = getJson(cand);
-        if (json && DecodeComfyUI(json, cand.text(), info)) {
+        bool negZeroed = false;
+        if (json && DecodeComfyUI(json, cand.text(), info, &negZeroed)) {
             // Some metadata-saving nodes embed a flattened A1111-style text
             // block alongside the graph, carrying fields no node holds. Fill
             // only the gaps; the graph's own values are more precise.
@@ -610,6 +625,11 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
                     (trimmedFallbackNeg == trimWs(fallback.prompt) || trimmedFallbackNeg == trimWs(info.prompt))) {
                     fallback.negative_prompt.clear();
                 }
+                // A zeroed or structurally absent graph negative (a guider
+                // with no negative input at all) is deliberately blank, so
+                // whatever the companion says ("-", "unknown" placeholders, or
+                // the zeroed encoder's own text) must not fill it.
+                if (negZeroed) fallback.negative_prompt.clear();
                 MergeGaps(info, fallback);
                 break;
             }
@@ -842,6 +862,50 @@ std::string BuildLoraList(const std::string& prompt, const std::string& hashName
 }
 } // namespace
 
+namespace {
+// Next top-level ", " at or after `from`, skipping any inside a double-quoted
+// span. A backslash inside a quoted span escapes the next character, so an
+// escaped quote (a value like "x \", y") does not close the span.
+size_t FindTopLevelComma(const char* s, size_t n, size_t from) {
+    bool inQuotes = false;
+    for (size_t i = from; i < n; i++) {
+        if (s[i] == '"') inQuotes = !inQuotes;
+        else if (inQuotes && s[i] == '\\') i++;
+        else if (!inQuotes && s[i] == ',' && i + 1 < n && s[i + 1] == ' ') return i;
+    }
+    return std::string::npos;
+}
+
+// True when [b, e) looks like A1111's parameters line: at least three
+// top-level "key: value" segments with plain keys. A1111 itself finds the line
+// as the last line of the text, so a prompt that merely mentions "Steps:" can
+// never be mistaken for it.
+bool LooksLikeParamsLine(const std::string& t, size_t b, size_t e) {
+    int segments = 0;
+    size_t start = b;
+    while (start < e) {
+        size_t comma = FindTopLevelComma(t.c_str(), e, start);
+        size_t segEnd = comma == std::string::npos ? e : comma;
+        size_t colon = t.find(':', start);
+        if (colon < segEnd && (colon + 1 == segEnd || t[colon + 1] == ' ')) {
+            size_t kb = start, ke = colon;
+            while (kb < ke && t[kb] == ' ') kb++;
+            while (ke > kb && t[ke - 1] == ' ') ke--;
+            bool ok = ke > kb;
+            for (size_t i = kb; ok && i < ke; i++) {
+                char c = t[i];
+                ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                     c == '_' || c == ' ' || c == '/' || c == '-';
+            }
+            if (ok) segments++;
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 2;
+    }
+    return segments >= 3;
+}
+} // namespace
+
 bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& info, bool populateFullParameters) {
     if (paramText.empty()) return false;
 
@@ -860,9 +924,34 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
     // so don't copy the whole companion text block just to discard it.
     if (populateFullParameters) info.full_parameters_utf8 = paramText;
 
-    size_t negPos = paramText.find("Negative prompt:");
-    size_t stepsPos = paramText.find("Steps:");
-    if (stepsPos == std::string::npos) stepsPos = paramText.find("Sampler:");
+    // A1111 takes the last non-empty line as the parameters line and only
+    // honours "Negative prompt:" at a line start; a plain find() split a prompt
+    // that mentions either label mid-text, and put a "Seed: N, ..." line that
+    // precedes "Steps:" into the negative prompt.
+    size_t negPos = std::string::npos;
+    for (size_t p = paramText.find("Negative prompt:"); p != std::string::npos; p = paramText.find("Negative prompt:", p + 1)) {
+        if (p == 0 || paramText[p - 1] == '\n') { negPos = p; break; }
+    }
+    size_t stepsPos = std::string::npos;
+    bool paramsLineFound = false;
+    {
+        size_t e = paramText.size();
+        while (e > 0 && (paramText[e - 1] == ' ' || paramText[e - 1] == '\t' || paramText[e - 1] == '\r' || paramText[e - 1] == '\n')) e--;
+        size_t nl = e ? paramText.rfind('\n', e - 1) : std::string::npos;
+        if (nl != std::string::npos) {
+            size_t ls = nl + 1;
+            while (ls < e && (paramText[ls] == ' ' || paramText[ls] == '\t' || paramText[ls] == '\r')) ls++;
+            if (ls < e && LooksLikeParamsLine(paramText, ls, e)) {
+                stepsPos = ls;
+                paramsLineFound = true;
+                if (negPos != std::string::npos && negPos >= stepsPos) negPos = std::string::npos;
+            }
+        }
+    }
+    if (!paramsLineFound) {
+        stepsPos = paramText.find("Steps:");
+        if (stepsPos == std::string::npos) stepsPos = paramText.find("Sampler:");
+    }
 
     std::string posPrompt, negPrompt, paramsLine;
 
@@ -919,14 +1008,7 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
         // "Lora hashes" is itself a quoted comma-separated sub-list, so a
         // plain find(", ") would split inside the quotes and truncate it.
         auto findNextComma = [&](size_t from) -> size_t {
-            bool inQuotes = false;
-            for (size_t i = from; i < paramsLine.size(); i++) {
-                if (paramsLine[i] == '"') inQuotes = !inQuotes;
-                else if (!inQuotes && paramsLine[i] == ',' && i + 1 < paramsLine.size() && paramsLine[i + 1] == ' ') {
-                    return i;
-                }
-            }
-            return std::string::npos;
+            return FindTopLevelComma(paramsLine.c_str(), paramsLine.size(), from);
         };
         // Compares the key span against a literal without materializing a
         // std::string per key: this runs over 15+ keys on every A1111 file.
@@ -974,7 +1056,7 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
                 } else if (keyIs("Model")) {
                     info.model = Utf8ToWstring(v);
                 } else if (keyIs("Model hash")) {
-                    info.model_hash = Utf8ToWstring(v);
+                    if (!IsEmptyInputSha256Prefix(v)) info.model_hash = Utf8ToWstring(v);
                 } else if (keyIs("Clip skip")) {
                     info.clip_skip = AImgDecoderInternal::ParseLeadingInt(v.c_str());
                     info.has_clip_skip = true;
@@ -1579,6 +1661,65 @@ bool AImgDecoder::DecodeWanGP(const SimpleJson::JsonValue* root, const std::stri
 // SwarmUI Decoder
 // ---------------------------------------------------------------------------
 
+namespace {
+// "loras"/"loraweights" are a JSON array of strings in real files but SwarmUI's
+// format also allows one comma-separated string; accept both.
+// Walks such a list one trimmed item at a time without materializing it.
+struct SwarmListCursor {
+    const SimpleJson::JsonValue* v;
+    size_t idx = 0;      // array index, or byte offset into a string list
+    bool done = false;
+    explicit SwarmListCursor(const SimpleJson::JsonValue* list) : v(list) {}
+    bool Next(std::string& out) {
+        out.clear();
+        if (!v || done) return false;
+        if (v->type == SimpleJson::JsonType::Array) {
+            if (idx >= v->arrVal.size()) return false;
+            const SimpleJson::JsonValue* item = v->arrVal[idx++].get();
+            if (item && item->type == SimpleJson::JsonType::Number) {
+                out = AImgDecoderInternal::FormatCompactNumber(item->numVal);
+                return true;
+            }
+            if (item && item->type == SimpleJson::JsonType::String) Assign(out, item->strVal, 0, item->strVal.size());
+            return true;
+        }
+        if (v->type != SimpleJson::JsonType::String) return false;
+        const std::string& s = v->strVal;
+        size_t comma = s.find(',', idx);
+        size_t end = comma == std::string::npos ? s.size() : comma;
+        Assign(out, s, idx, end);
+        if (comma == std::string::npos) done = true; else idx = comma + 1;
+        return true;
+    }
+    static void Assign(std::string& out, const std::string& s, size_t b, size_t e) {
+        while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) b++;
+        while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) e--;
+        out.assign(s, b, e - b);
+    }
+};
+
+std::string SwarmLoraList(const SimpleJson::JsonValue* names, const SimpleJson::JsonValue* weights) {
+    SwarmListCursor n(names), w(weights);
+    std::string joined, name, weight;
+    while (n.Next(name)) {
+        bool hasWeight = w.Next(weight);
+        if (name.empty()) continue;
+        if (!joined.empty()) joined += ", ";
+        joined += name;
+        if (!hasWeight || weight.empty()) continue;
+        joined += ": ";
+        const char* end = nullptr;
+        double d;
+        if (AImgDecoderInternal::ParseDouble(weight.c_str(), &end, d) && *end == '\0') {
+            joined += AImgDecoderInternal::FormatCompactNumber(d);
+        } else {
+            joined += weight; // non-numeric weight: keep as written
+        }
+    }
+    return joined;
+}
+} // namespace
+
 bool AImgDecoder::DecodeSwarmUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info) {
     // A real SwarmUI PNG nests its parameters under "sui_image_params", not
     // at the root -- unwrap when present, but keep the flat shape working.
@@ -1590,9 +1731,31 @@ bool AImgDecoder::DecodeSwarmUI(const SimpleJson::JsonValue* root, const std::st
     // without this gate any JSON object would match.
     static const SimpleGeneratorConfig cfg = {
         "cfgscale", "negativeprompt", L"SwarmUI",
-        "prompt", "", "negativeprompt", "model", "cfgscale", ""
+        "prompt", "", "negativeprompt", "model", "cfgscale", "sampler"
     };
-    return DecodeSimpleGraphGenerator(unwrapped, originalText, info, cfg);
+    if (!DecodeSimpleGraphGenerator(unwrapped, originalText, info, cfg)) return false;
+    if (!unwrapped) return true;
+
+    std::string s = unwrapped->getStr("scheduler");
+    if (!s.empty()) info.scheduler = Utf8ToWstring(s);
+    s = unwrapped->getStr("vae");
+    if (!s.empty()) info.vae = Utf8ToWstring(s);
+
+    double num;
+    double w = 0, h = 0;
+    if (JsonNumericValue(unwrapped->find("width"), w) && JsonNumericValue(unwrapped->find("height"), h)) {
+        info.size = MakeSizeString(SimpleJson::ClampDoubleToInt64(w), SimpleJson::ClampDoubleToInt64(h));
+    }
+
+    std::string lora = SwarmLoraList(unwrapped->find("loras"), unwrapped->find("loraweights"));
+    if (!lora.empty()) info.lora = Utf8ToWstring(lora);
+
+    // clipstopatlayer is stored negative (-2 = A1111's "Clip skip: 2").
+    if (JsonNumericValue(unwrapped->find("clipstopatlayer"), num) && num < 0) {
+        info.clip_skip = (int32_t)SimpleJson::ClampDoubleToInt64(-num);
+        info.has_clip_skip = true;
+    }
+    return true;
 }
 
 
