@@ -87,10 +87,23 @@ void ExtractLoraTags(const std::string& text, std::vector<std::string>& out) {
         size_t colon = tag.find(':');
         std::string name = colon == std::string::npos ? tag : tag.substr(0, colon);
         std::string weight = colon == std::string::npos ? "1" : tag.substr(colon + 1);
+        // A plain number shows the way every other LoRA weight does ("1." and
+        // "1.0" as "1"); anything else, e.g. a "model:clip" pair, as written.
+        double w;
+        const char* wEnd = nullptr;
+        if (!weight.empty() && AImgDecoderInternal::ParseDouble(weight.c_str(), &wEnd, w) && *wEnd == '\0')
+            weight = FormatCompactNumber(w);
         if (!name.empty()) out.push_back(name + ": " + weight);
         pos = end + 1;
     }
 }
+
+// Nodes that apply the "<lora:name:weight>" tags in their own text; returns
+// whether classType is one. Not generalised to every prompt: a plain
+// CLIPTextEncode ignores such tags, and pasted A1111 prompts often carry dead
+// ones. Out of line: inlined into the node loop it cost ~2 KB on x64/MT.
+__declspec(noinline) bool CollectTaggedLoras(const JsonValue* nodesObj, const std::string& classType, const JsonValue* inputs,
+                                             std::vector<std::string>& loras);
 
 std::string TrimWs(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -188,11 +201,197 @@ double ResolveNumberField(const JsonValue* nodesObj, const JsonValue* field, boo
 // A join of literal separators only (",", ", ") is what a join node yields when
 // every real part was unresolvable; showing that is a visible wrong answer, so
 // it counts as empty. Bytes >= 0x80 count as text so CJK/UTF-8 prompts survive.
-std::string DropIfNoAlnum(std::string s) {
+bool IsWordByte(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80;
+}
+
+bool HasAlnum(const std::string& s) {
     for (unsigned char c : s) {
-        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80) return s;
+        if (IsWordByte(c)) return true;
     }
+    return false;
+}
+
+std::string DropIfNoAlnum(std::string s) {
+    if (HasAlnum(s)) return s;
     return std::string();
+}
+
+// "Empty" from the text resolvers is either empty by design (a toggle with no
+// words) or a dead end (value chosen at run time, link to nowhere). A join
+// skips the first but must not paper over the second. This flag marks the
+// second kind; ResolveJoinPart and the conditioning join save, clear and
+// restore it. Function-local thread_local for the same C++14 reason as
+// ResolveTextField's step counter.
+bool& TextUnresolvedFlag() {
+    static thread_local bool flag = false;
+    return flag;
+}
+
+// class_type of the first dead end hit, valid only while TextUnresolvedFlag()
+// is set. A pointer into the JSON tree, not a std::string: a thread_local with
+// a destructor pulls in the CRT's TLS destructor machinery (~2.3 KB x64/MT).
+const char*& DeadEndClass() {
+    static thread_local const char* cls = nullptr;
+    return cls;
+}
+
+// A dead end with no node to name (missing node, depth or budget exhausted)
+// shows as "[...]" with a real ellipsis, spelled as a UTF-8 escape because the
+// sources are compiled without /utf-8.
+const char* const kDeadEndUnnamed = "\xE2\x80\xA6";
+
+// Sets the unresolved verdict and records the node. The first dead end wins, so
+// the innermost producer is the one named; a stale class left over while the
+// flag was clear never survives.
+void MarkDeadEnd(const char* classType) {
+    bool& flag = TextUnresolvedFlag();
+    const char*& cls = DeadEndClass();
+    if (!flag || !cls) cls = (classType && *classType) ? classType : kDeadEndUnnamed;
+    flag = true;
+}
+
+void MarkDeadEnd() { MarkDeadEnd(kDeadEndUnnamed); }
+
+// The node's own class_type string, stable for the life of the JSON tree.
+const char* NodeClassType(const JsonValue* node) {
+    const JsonValue* v = node ? node->find("class_type") : nullptr;
+    return (v && v->type == JsonType::String) ? v->strVal.c_str() : nullptr;
+}
+
+// Set when a join returned text that contains dead-end markers beside real
+// parts. DecodeComfyUI clears it before each resolution it assigns to a prompt
+// role and reads it afterwards, so a companion text block can replace such a
+// partial prompt but not a complete one.
+bool& PartialTextFlag() {
+    static thread_local bool flag = false;
+    return flag;
+}
+
+// Whether the part ResolveJoinPart just returned was itself a partial join, so
+// a marker can sit on its edge; read right after the call. The enclosing join
+// needs it to space that edge marker like one of its own.
+bool& LastJoinPartPartial() {
+    static thread_local bool flag = false;
+    return flag;
+}
+
+// ResolveTextField for one part of a join: reports through `unresolved` whether
+// the part came back empty because of a dead end (as opposed to being empty by
+// design), and keeps that verdict set for any enclosing join. `deadClass`
+// receives the node that ended the part when it did.
+std::string ResolveJoinPart(const JsonValue* nodesObj, const JsonValue* field, const char* preferredKey, int depth, bool& unresolved,
+                            const char*& deadClass);
+
+// Set when a join blanked on a dead end while other parts held text. Such an
+// encoder still holds the guessed positive slot in DecodeComfyUI, so the next
+// encoder in id order (typically the negative) is not promoted into it.
+// Whitespace counts as text here: a lone " " held the slot before, too.
+bool& JoinBlankedFlag() {
+    static thread_local bool flag = false;
+    return flag;
+}
+
+std::string JoinBlanked(const std::string& partialText) {
+    if (!partialText.empty()) JoinBlankedFlag() = true;
+    return std::string();
+}
+
+// Appends one piece to a join. Next to a dead-end marker exactly one space
+// separates it from a word character (letter, digit or byte >= 0x80), across
+// the separator, and a run of spaces touching it is cut to one. Punctuation
+// and newlines next to a marker are left alone; text away from a marker is
+// joined exactly as the node would join it.
+void AppendJoinPiece(std::string& out, const std::string& sep, const std::string& piece, bool pieceIsMarker, bool prevWasMarker) {
+    // Works on index ranges of sep/piece rather than building sep + piece and
+    // editing it: the temporary and its erase/insert cost ~600 bytes of code.
+    const bool first = out.empty();
+    size_t si = 0, pi = 0;
+    if (prevWasMarker) {
+        // The space run right after the marker spans the separator and then the
+        // piece; skip all of it and write back at most one space.
+        bool sawSpace = false;
+        if (!first) while (si < sep.size() && sep[si] == ' ') { si++; sawSpace = true; }
+        if (first || si == sep.size()) while (pi < piece.size() && piece[pi] == ' ') { pi++; sawSpace = true; }
+        const char next = (!first && si < sep.size()) ? sep[si] : (pi < piece.size() ? piece[pi] : char(0));
+        if (sawSpace || IsWordByte((unsigned char)next)) out += ' ';
+    }
+    if (!first) out.append(sep, si, std::string::npos);
+    if (pieceIsMarker) {
+        size_t end = out.size(), begin = end;
+        while (begin > 0 && out[begin - 1] == ' ') begin--;
+        if (end - begin > 1) out.resize(begin + 1);
+        else if (end == begin && !out.empty() && IsWordByte((unsigned char)out.back())) out += ' ';
+    }
+    out.append(piece, pi, std::string::npos);
+}
+
+// Collects the parts of one API-format join. A dead-end part is shown as
+// "[class]" when the join still holds a known part with a letter or digit; with
+// none, the join stays blank (the companion text or nothing is better than a
+// lone marker). The unresolved verdict is not left set on a partial result: the
+// text is usable, so an enclosing join must treat it as a known part.
+struct JoinCollector {
+    const std::string sep;
+    std::string shown;          // known parts and markers, as displayed
+    std::string known;          // known parts only, the old blanked-join text
+    bool lastWasMarker = false;
+    bool knownAlnum = false;
+    bool anyDead = false;
+    const bool savedFlag;
+    const char* const savedClass;
+
+    explicit JoinCollector(const std::string& separator)
+        : sep(separator), savedFlag(TextUnresolvedFlag()), savedClass(DeadEndClass()) {}
+
+    // `partial`: the part is a partial join itself, so a '[' / ']' on its
+    // edge is one of its markers and gets the same spacing rule.
+    void AddKnown(const std::string& part, bool partial = false) {
+        if (part.empty()) return;
+        if (!known.empty()) known += sep;
+        known += part;
+        if (HasAlnum(part)) knownAlnum = true;
+        AppendJoinPiece(shown, sep, part, partial && part.front() == '[', lastWasMarker);
+        lastWasMarker = partial && part.back() == ']';
+    }
+
+    void AddDead(const char* cls) {
+        anyDead = true;
+        std::string marker(1, '[');
+        marker += cls ? cls : kDeadEndUnnamed;
+        marker += ']';
+        AppendJoinPiece(shown, sep, marker, true, lastWasMarker);
+        lastWasMarker = true;
+    }
+
+    // Common tail. `markJoinBlank` selects whether a blanked join also holds the
+    // positive slot (JoinBlankedFlag); the conditioning join never did.
+    std::string Finish(bool markJoinBlank) {
+        if (!anyDead) return DropIfNoAlnum(std::move(shown));
+        if (!knownAlnum) return markJoinBlank ? JoinBlanked(known) : std::string();
+        TextUnresolvedFlag() = savedFlag;
+        DeadEndClass() = savedClass;
+        PartialTextFlag() = true;
+        return std::move(shown);
+    }
+};
+
+// Join of the named inputs of one node, for join types that differ only in
+// key names and separator. Same contract as JoinCollector; absent keys are
+// skipped (many of these nodes leave their second input unwired).
+std::string JoinTextParts(const JsonValue* nodesObj, const JsonValue* refInputs, const std::vector<std::string>& keys,
+                          const std::string& sep, const char* preferredKey, int depth) {
+    JoinCollector jc(sep);
+    for (const std::string& key : keys) {
+        const JsonValue* v = refInputs->find(key);
+        if (!v) continue;
+        bool unresolved = false;
+        const char* deadClass = nullptr;
+        std::string part = ResolveJoinPart(nodesObj, v, preferredKey, depth + 1, unresolved, deadClass);
+        if (unresolved) jc.AddDead(deadClass);
+        else jc.AddKnown(part, LastJoinPartPartial());
+    }
+    return jc.Finish(true);
 }
 
 // Reached from both ResolveTextField (a plain text link) and ResolveClipText
@@ -207,8 +406,9 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
     // thread_local for the same C++17-avoidance reason as AbortFlagSlot().
     static thread_local int steps = 0;
     if (depth == 0) steps = 0;
-    if (++steps > 4096) return "";
-    if (!field || depth > 12) return "";
+    if (++steps > 4096) { MarkDeadEnd(); return ""; }
+    if (!field) return "";
+    if (depth > 12) { MarkDeadEnd(); return ""; }
     if (field->type == JsonType::String) return field->strVal;
     if (field->type == JsonType::Number) {
         // A numeric literal feeding a text field: stringify, don't lose it.
@@ -221,9 +421,9 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
     std::string nodeId = GetLinkNodeId(field);
     if (nodeId.empty()) return "";
     auto it = nodesObj->objVal.find(nodeId);
-    if (it == nodesObj->objVal.end() || !it->second) return "";
+    if (it == nodesObj->objVal.end() || !it->second) { MarkDeadEnd(); return ""; }
     const auto* refInputs = it->second->getObj("inputs");
-    if (!refInputs) return "";
+    if (!refInputs) { MarkDeadEnd(NodeClassType(it->second.get())); return ""; }
 
     // Prompt-enhancement workflows route "text" through stock control-flow
     // nodes before the literal. Both graph formats serialize the same node's
@@ -259,28 +459,33 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
     if (classType == "StringConcatenate") {
         const JsonValue* aField = refInputs->find("string_a");
         const JsonValue* bField = refInputs->find("string_b");
-        std::string a = aField ? ResolveTextField(nodesObj, aField, preferredKey, depth + 1) : "";
-        std::string b = bField ? ResolveTextField(nodesObj, bField, preferredKey, depth + 1) : "";
+        bool unresolvedA = false, unresolvedB = false;
+        const char* clsA = nullptr;
+        const char* clsB = nullptr;
+        std::string a = aField ? ResolveJoinPart(nodesObj, aField, preferredKey, depth + 1, unresolvedA, clsA) : "";
+        const bool partialA = aField && LastJoinPartPartial();
+        std::string b = bField ? ResolveJoinPart(nodesObj, bField, preferredKey, depth + 1, unresolvedB, clsB) : "";
+        const bool partialB = bField && LastJoinPartPartial();
+        std::string sep = refInputs->getStr("delimiter");
+        // A part chosen at run time must not leave its sibling standing alone
+        // as if it were the whole string: it is shown as a marker, or the join
+        // is blank when nothing readable is left (see JoinCollector). A part
+        // that is a partial join itself goes the same way, for marker spacing.
+        if (unresolvedA || unresolvedB || partialA || partialB) {
+            JoinCollector jc(sep);
+            if (unresolvedA) jc.AddDead(clsA); else jc.AddKnown(a, partialA);
+            if (unresolvedB) jc.AddDead(clsB); else jc.AddKnown(b, partialB);
+            return jc.Finish(true);
+        }
         if (a.empty()) return b;
         if (b.empty()) return a;
-        std::string sep = refInputs->getStr("delimiter");
         return DropIfNoAlnum(a + sep + b);
     }
     if (classType == "Text Concatenate") {
         // API-format twin of the UI branch in ResolveUiTextThroughLink. An
         // absent delimiter joins with "" rather than an invented default.
-        std::string sep = refInputs->getStr("delimiter");
-        std::string joined;
-        static const char* const kParts[] = {"text_a", "text_b", "text_c", "text_d"};
-        for (const char* key : kParts) {
-            const JsonValue* v = refInputs->find(key);
-            if (!v) continue;
-            std::string part = ResolveTextField(nodesObj, v, preferredKey, depth + 1);
-            if (part.empty()) continue;
-            if (!joined.empty()) joined += sep;
-            joined += part;
-        }
-        return DropIfNoAlnum(std::move(joined));
+        return JoinTextParts(nodesObj, refInputs, {"text_a", "text_b", "text_c", "text_d"}, refInputs->getStr("delimiter"),
+                             preferredKey, depth);
     }
     if (classType == "Reroute" || classType == "PreviewAny") {
         if (const JsonValue* v = refInputs->find("source")) {
@@ -300,12 +505,62 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
         }
         return "";
     }
-    if (classType == "String Literal") {
+    if (classType == "CR Prompt Text") {
+        // Its text lives in "prompt", which the generic fallback never reads.
+        if (const JsonValue* v = refInputs->find("prompt")) return ResolveTextField(nodesObj, v, preferredKey, depth + 1);
+        return "";
+    }
+    if (classType == "String Literal" || classType == "StringConstantMultiline" || classType == "StringConstant" ||
+        classType == "Primitive string multiline [Crystools]" || classType == "Primitive string [Crystools]") {
         // Its text lives in "string", which the generic fallback never reads.
+        // Exact names only: transform nodes such as StringReplace also take a
+        // "string" input. "strip_newlines" is ignored.
         if (const JsonValue* v = refInputs->find("string")) {
             return ResolveTextField(nodesObj, v, preferredKey, depth + 1);
         }
         return "";
+    }
+    if (classType == "JoinStringMulti") {
+        // KJNodes: string_1..string_<inputcount>. Keys are built in numeric
+        // order here; objVal is a std::map, so iterating it would put
+        // string_10 before string_2.
+        std::vector<std::string> keys;
+        bool countFound = false;
+        double n = ResolveNumberField(nodesObj, refInputs->find("inputcount"), countFound);
+        if (countFound) {
+            int64_t count = ClampDoubleToInt64(n);
+            if (count > 64) count = 64;
+            for (int64_t i = 1; i <= count; ++i) keys.push_back("string_" + std::to_string(i));
+        } else {
+            for (int i = 1; i <= 64; ++i) {
+                std::string key = "string_" + std::to_string(i);
+                if (!refInputs->find(key)) break;
+                keys.push_back(std::move(key));
+            }
+        }
+        return JoinTextParts(nodesObj, refInputs, keys, refInputs->getStr("delimiter"), preferredKey, depth);
+    }
+    if (classType == "JoinStrings") {
+        return JoinTextParts(nodesObj, refInputs, {"string1", "string2"}, refInputs->getStr("delimiter"), preferredKey, depth);
+    }
+    if (classType == "JWStringConcat") {
+        return JoinTextParts(nodesObj, refInputs, {"a", "b"}, std::string(), preferredKey, depth);
+    }
+    if (classType == "CR Text Concatenate") {
+        // The separator may itself be a link. A separator that cannot be read
+        // joins with "" and never blanks the result, so its dead-end verdict is
+        // kept out of the enclosing join's flag.
+        bool& unresolvedFlag = TextUnresolvedFlag();
+        const bool savedFlag = unresolvedFlag;
+        std::string sep = ResolveTextField(nodesObj, refInputs->find("separator"), preferredKey, depth + 1);
+        unresolvedFlag = savedFlag;
+        return JoinTextParts(nodesObj, refInputs, {"text1", "text2"}, sep, preferredKey, depth);
+    }
+    if (classType == "Text Concatenate (JPS)") {
+        // The delimiter is a choice name, not the separator text itself.
+        std::string delim = refInputs->getStr("delimiter");
+        std::string sep = delim == "comma" ? ", " : delim == "space" ? " " : delim == "none" ? "" : delim;
+        return JoinTextParts(nodesObj, refInputs, {"text1", "text2", "text3", "text4", "text5"}, sep, preferredKey, depth);
     }
     if (classType == "Flux_Finish_StylesStyler") {
         // A style-preset node fed by a "text_positive"/"text_negative" pair
@@ -328,9 +583,10 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
         // "append" joins text_a..c (", " only when tidy_tags is "yes");
         // "replace" substitutes text_b with text_c in text_a. Its "result"
         // field is never read: it is a cached display value from the last run.
-        std::string a = ResolveTextField(nodesObj, refInputs->find("text_a"), preferredKey, depth + 1);
-        std::string b = ResolveTextField(nodesObj, refInputs->find("text_b"), preferredKey, depth + 1);
-        if (refInputs->getStr("action") == "replace") {
+        const bool isReplace = refInputs->getStr("action") == "replace";
+        if (isReplace) {
+            std::string a = ResolveTextField(nodesObj, refInputs->find("text_a"), preferredKey, depth + 1);
+            std::string b = ResolveTextField(nodesObj, refInputs->find("text_b"), preferredKey, depth + 1);
             std::string c = ResolveTextField(nodesObj, refInputs->find("text_c"), preferredKey, depth + 1);
             if (b.empty()) return a;
             std::string result;
@@ -344,16 +600,8 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
             }
             return result;
         }
-        std::string c = ResolveTextField(nodesObj, refInputs->find("text_c"), preferredKey, depth + 1);
-        std::string sep = refInputs->getStr("tidy_tags") == "yes" ? ", " : "";
-        std::string joined;
-        const std::string* parts[] = {&a, &b, &c};
-        for (const std::string* part : parts) {
-            if (part->empty()) continue;
-            if (!joined.empty()) joined += sep;
-            joined += *part;
-        }
-        return DropIfNoAlnum(std::move(joined));
+        return JoinTextParts(nodesObj, refInputs, {"text_a", "text_b", "text_c"},
+                             refInputs->getStr("tidy_tags") == "yes" ? ", " : "", preferredKey, depth);
     }
     if (classType == "Any Switch (rgthree)") {
         // The node has no selected-index widget: the first any_NN input (key
@@ -376,11 +624,23 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
     }
     if (classType == "easy promptConcat") {
         // "prompt2" is an optional input commonly left unwired.
-        std::string p1 = ResolveTextField(nodesObj, refInputs->find("prompt1"), preferredKey, depth + 1);
-        std::string p2 = ResolveTextField(nodesObj, refInputs->find("prompt2"), preferredKey, depth + 1);
+        bool unresolved1 = false, unresolved2 = false;
+        const char* cls1 = nullptr;
+        const char* cls2 = nullptr;
+        std::string p1 = ResolveJoinPart(nodesObj, refInputs->find("prompt1"), preferredKey, depth + 1, unresolved1, cls1);
+        const bool partial1 = LastJoinPartPartial();
+        std::string p2 = ResolveJoinPart(nodesObj, refInputs->find("prompt2"), preferredKey, depth + 1, unresolved2, cls2);
+        const bool partial2 = LastJoinPartPartial();
+        const std::string sep = refInputs->getStr("separator");
+        if (unresolved1 || unresolved2 || partial1 || partial2) {
+            JoinCollector jc(sep);
+            if (unresolved1) jc.AddDead(cls1); else jc.AddKnown(p1, partial1);
+            if (unresolved2) jc.AddDead(cls2); else jc.AddKnown(p2, partial2);
+            return jc.Finish(true);
+        }
         if (p1.empty()) return p2;
         if (p2.empty()) return p1;
-        return DropIfNoAlnum(p1 + refInputs->getStr("separator") + p2);
+        return DropIfNoAlnum(p1 + sep + p2);
     }
     if (classType == "easy positive") {
         if (const JsonValue* v = refInputs->find("positive")) {
@@ -531,7 +791,53 @@ std::string ResolveTextField(const JsonValue* nodesObj, const JsonValue* field, 
         std::string r = ResolveTextField(nodesObj, v, preferredKey, depth + 1);
         if (!r.empty()) return r;
     }
+    // No key to read at all (a run-time selector keeps only its choices, not
+    // the choice): a dead end, unlike a key that was present but empty.
+    if (!(preferredKey && refInputs->find(preferredKey)) && !refInputs->find("text") && !refInputs->find("value")) {
+        MarkDeadEnd(NodeClassType(it->second.get()));
+    }
     return "";
+}
+
+bool CollectTaggedLoras(const JsonValue* nodesObj, const std::string& classType, const JsonValue* inputs,
+                        std::vector<std::string>& loras) {
+    const char* key;
+    if (classType == "LoraTagLoader") key = "text";
+    else if (classType == "WebUIPromptBridge") key = "positive_prompt";
+    else if (classType == "ImpactWildcardEncode") key = "populated_text";
+    else return false;
+    std::string text;
+    if (const JsonValue* v = inputs->find(key)) text = ResolveTextField(nodesObj, v);
+    // Impact: populated_text is the wildcard-expanded text this run used; the
+    // authored wildcard_text only when it is empty (as for the prompt).
+    if (text.empty() && classType == "ImpactWildcardEncode") {
+        if (const JsonValue* v = inputs->find("wildcard_text")) text = ResolveTextField(nodesObj, v);
+    }
+    ExtractLoraTags(text, loras);
+    return true;
+}
+
+std::string ResolveJoinPart(const JsonValue* nodesObj, const JsonValue* field, const char* preferredKey, int depth, bool& unresolved,
+                            const char*& deadClass) {
+    bool& flag = TextUnresolvedFlag();
+    const char*& cls = DeadEndClass();
+    const bool saved = flag;
+    const char* const savedCls = cls;
+    cls = nullptr;
+    flag = false;
+    bool& partialFlag = PartialTextFlag();
+    const bool savedPartial = partialFlag;
+    partialFlag = false;
+    std::string result = ResolveTextField(nodesObj, field, preferredKey, depth);
+    LastJoinPartPartial() = partialFlag && !result.empty();
+    partialFlag = savedPartial || partialFlag;
+    unresolved = flag && result.empty();
+    deadClass = unresolved ? cls : nullptr;
+    flag = saved || unresolved;
+    // The earliest dead end stays the one named for an enclosing join.
+    if (saved) cls = savedCls;
+    else if (!unresolved) cls = nullptr;
+    return result;
 }
 
 // Numeric counterpart to ResolveTextField. Unlike text nodes, numeric
@@ -640,11 +946,12 @@ bool IsZeroedConditioning(const JsonValue* nodesObj, std::string id) {
 // "prompt" and "negative_prompt" on the SAME node instead of a shared
 // "text"; isPositive picks between them. depth bounds the passthrough follows.
 std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId, bool isPositive, int depth = 0) {
-    if (nodeId.empty() || depth > 4) return "";
+    if (nodeId.empty()) return "";
+    if (depth > 4) { MarkDeadEnd(); return ""; }
     auto it = nodesObj->objVal.find(nodeId);
-    if (it == nodesObj->objVal.end() || !it->second) return "";
+    if (it == nodesObj->objVal.end() || !it->second) { MarkDeadEnd(); return ""; }
     const auto* refInputs = it->second->getObj("inputs");
-    if (!refInputs) return "";
+    if (!refInputs) { MarkDeadEnd(NodeClassType(it->second.get())); return ""; }
     std::string classType = it->second->getStr("class_type");
     // "wildcard_text" is the authored template with unexpanded {a|b}
     // alternatives; "populated_text" is what this generation actually used.
@@ -705,15 +1012,54 @@ std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId
         }
         return "";
     }
+    // Joined conditionings show both sides' text, to-then-from for Concat. A
+    // zero-out side contributes nothing; a run-time side follows the marker
+    // rule of the other joins rather than leaving the other side standing alone.
+    if (classType == "ConditioningConcat" || classType == "ConditioningCombine") {
+        const bool isConcat = classType == "ConditioningConcat";
+        const char* const sides[2] = {isConcat ? "conditioning_to" : "conditioning_1",
+                                      isConcat ? "conditioning_from" : "conditioning_2"};
+        JoinCollector jc(", ");
+        for (const char* key : sides) {
+            const JsonValue* v = refInputs->find(key);
+            std::string targetId = v ? GetLinkNodeId(v) : "";
+            if (targetId.empty() || IsZeroedConditioning(nodesObj, targetId)) continue;
+            bool& flag = TextUnresolvedFlag();
+            const char*& cls = DeadEndClass();
+            const bool saved = flag;
+            const char* const savedCls = cls;
+            cls = nullptr;
+            flag = false;
+            std::string part = ResolveClipText(nodesObj, targetId, isPositive, depth + 1);
+            const bool unresolved = flag && part.empty();
+            const char* const deadClass = unresolved ? cls : nullptr;
+            flag = saved || unresolved;
+            if (saved) cls = savedCls;
+            else if (!unresolved) cls = nullptr;
+            if (unresolved) jc.AddDead(deadClass);
+            else jc.AddKnown(part);
+        }
+        return jc.Finish(false);
+    }
     // A tag-concatenating node with three STRING inputs and no "text" field
     // of its own. Real files carry their own trailing punctuation, so join
     // with nothing rather than guessing a delimiter.
     if (classType.find("Get Booru Tag") != std::string::npos) {
-        std::string joined;
+        JoinCollector jc((std::string()));
         for (const char* key : {"text_a", "text_b", "text_c"}) {
-            if (const JsonValue* v = refInputs->find(key)) joined += ResolveTextField(nodesObj, v);
+            if (const JsonValue* v = refInputs->find(key)) {
+                bool unresolved = false;
+                const char* deadClass = nullptr;
+                std::string part = ResolveJoinPart(nodesObj, v, nullptr, 0, unresolved, deadClass);
+                const bool partPartial = LastJoinPartPartial();
+                if (unresolved) jc.AddDead(deadClass);
+                else jc.AddKnown(part, partPartial);
+            }
         }
-        if (!joined.empty()) return joined;
+        // Same blank-or-marker rule as the other joins; a join with no dead
+        // end keeps its old fall-through when it came out empty.
+        if (jc.anyDead) return jc.Finish(false);
+        if (!jc.shown.empty()) return jc.shown;
     }
     if (classType == "CLIPTextEncodeSDXL") {
         return ResolveClipTextEncodeSdxl(nodesObj, refInputs, depth);
@@ -742,6 +1088,20 @@ std::string ResolveClipText(const JsonValue* nodesObj, const std::string& nodeId
     if (const JsonValue* v = refInputs->find(fallbackKey)) {
         return ResolveTextField(nodesObj, v);
     }
+    // A prompt bridge node (a sampler's positive/negative linked to its output
+    // slots) keeps the literals as "positive_prompt"/"negative_prompt".
+    if (isPositive) {
+        if (const JsonValue* v = refInputs->find("positive_prompt")) {
+            return ResolveTextField(nodesObj, v);
+        }
+    }
+    // An encoder holding both texts as literals named for their role (e.g.
+    // WeiLinComfyUIPromptToLoras). A literal string only: conditioning nodes
+    // such as ControlNet apply use the same names for CONDITIONING links.
+    if (const JsonValue* v = refInputs->find(isPositive ? "positive" : "negative")) {
+        if (v->type == JsonType::String && !v->strVal.empty()) return v->strVal;
+    }
+    MarkDeadEnd(NodeClassType(it->second.get()));
     return "";
 }
 
@@ -1476,11 +1836,15 @@ void ApplyWidgetFieldMap(const JsonValue* node, const WidgetFieldMap& m, const s
 
     if (!info.has_seed) {
         if (TryBoundaryNumber(node, "seed", scopeId, index, registry, num, unresolvable)) {
-            info.seed = ClampDoubleToInt64(num); info.has_seed = true;
+            // Out of int64 range: blank, and marked unresolvable so the
+            // stale local widget seed is not shown in its place.
+            if (SimpleJson::SeedFromDouble(num, info.seed)) info.has_seed = true;
+            else seedUnresolvable = true;
         } else {
             seedUnresolvable = unresolvable;
             if (TryBoundaryNumber(node, "noise_seed", scopeId, index, registry, num, unresolvable)) {
-                info.seed = ClampDoubleToInt64(num); info.has_seed = true;
+                if (SimpleJson::SeedFromDouble(num, info.seed)) info.has_seed = true;
+                else seedUnresolvable = true;
             } else if (unresolvable) {
                 seedUnresolvable = true;
             }
@@ -1520,7 +1884,7 @@ void ApplyWidgetFieldMap(const JsonValue* node, const WidgetFieldMap& m, const s
         if (idx < 0 || idx >= (int)wArr.size() || !wArr[idx]) return nullptr;
         return wArr[idx]->type == JsonType::String ? wArr[idx].get() : nullptr;
     };
-    if (!info.has_seed && !seedUnresolvable) { if (const auto* v = numAt(m.seedIdx)) { info.seed = ClampDoubleToInt64(v->numVal); info.has_seed = true; } }
+    if (!info.has_seed && !seedUnresolvable) { if (const auto* v = numAt(m.seedIdx)) { if (SimpleJson::SeedFromDouble(v->numVal, info.seed)) info.has_seed = true; } }
     if (!info.has_steps && !stepsUnresolvable) { if (const auto* v = numAt(m.stepsIdx)) { info.steps = (int32_t)ClampDoubleToInt64(v->numVal); info.has_steps = true; } }
     if (!info.has_cfg && !cfgUnresolvable) { if (const auto* v = numAt(m.cfgIdx)) { info.cfg_scale = v->numVal; info.has_cfg = true; } }
     if (!info.has_denoising_strength && !denoiseUnresolvable) { if (const auto* v = numAt(m.denoiseIdx)) { info.denoising_strength = v->numVal; info.has_denoising_strength = true; } }
@@ -2062,7 +2426,8 @@ ApiScopeInfo ComputeApiScope(const JsonValue* nodesObj) {
 
 } // namespace
 
-bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info, bool* outNegativeZeroed) {
+bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info, bool* outNegativeZeroed,
+                              bool* outPromptPartial, bool* outNegativePartial) {
     if (!root || root->type != SimpleJson::JsonType::Object) return false;
 
     // Every other decoder gates on a distinctive key before touching the
@@ -2102,7 +2467,17 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     // serialized graph carries no reliable base-vs-refiner signal, so this
     // stays documented incidental behaviour rather than a guessed heuristic.
     std::string positiveNodeId, negativeNodeId;
+    // A sampler that takes its prompt as STRING inputs ("positive_prompt"/
+    // "negative_prompt", e.g. the Anima pack's all-in-one samplers) rather than
+    // as CONDITIONING links: read through ResolveTextField below, when no
+    // conditioning link was found at all.
+    const JsonValue* posTextField = nullptr;
+    const JsonValue* negTextField = nullptr;
     std::string guessPosNodeId; // which node the encounter-order Prompt guess came from
+    bool posSlotHeld = false;   // an encoder whose join blanked holds the guessed positive slot, see JoinBlankedFlag
+    // The prompt text carries dead-end markers (PartialTextFlag). Each flag
+    // travels with its text: wherever the text is replaced or cleared, so is it.
+    bool posPartial = false, negPartial = false;
     // The node that supplied positiveNodeId has no "negative" input at all
     // (a BasicGuider), as opposed to one whose negative link did not resolve.
     bool posSourceLacksNegative = false;
@@ -2142,10 +2517,10 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             bool foundNum;
             if (const auto* v = inputs->find("seed")) {
                 double n = ResolveNumberField(nodesObj, v, foundNum, "seed");
-                if (foundNum) { local.seed = ClampDoubleToInt64(n); local.has_seed = true; }
+                if (foundNum && SimpleJson::SeedFromDouble(n, local.seed)) { local.has_seed = true; }
             } else if (const auto* v2 = inputs->find("noise_seed")) {
                 double n = ResolveNumberField(nodesObj, v2, foundNum, "noise_seed");
-                if (foundNum) { local.seed = ClampDoubleToInt64(n); local.has_seed = true; }
+                if (foundNum && SimpleJson::SeedFromDouble(n, local.seed)) { local.has_seed = true; }
             }
             // Two-stage samplers (a base pass plus a refine pass in one
             // node) prefix every field "stage1_"/"stage2_", so the lookups
@@ -2211,6 +2586,8 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             if (negativeNodeId.empty()) {
                 if (const auto* v = inputs->find("negative")) negativeNodeId = GetLinkNodeId(v);
             }
+            if (!posTextField) posTextField = inputs->find("positive_prompt");
+            if (!negTextField) negTextField = inputs->find("negative_prompt");
         }
         // Loader-held prompts ("Efficient Loader" and kin) carry the
         // positive/negative links on the LOADER, not the sampler: its
@@ -2235,36 +2612,47 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                 // finds no literal (only a wildcard-pool DSL). The node's own
                 // "displayed_text" already holds the expanded text.
                 std::string text = inputs->getStr("displayed_text");
-                if (ui.posPromptText.empty()) ui.posPromptText = text;
-                else if (ui.negPromptText.empty()) ui.negPromptText = text;
+                if (ui.posPromptText.empty() && !posSlotHeld) { ui.posPromptText = text; posPartial = false; }
+                else if (ui.negPromptText.empty()) { ui.negPromptText = text; negPartial = false; }
             } else if (const auto* textField = inputs->find("text")) {
+                JoinBlankedFlag() = false;
+                PartialTextFlag() = false;
                 std::string text = ResolveTextField(nodesObj, textField);
-                if (!text.empty() && !LooksLikeSerializedTextBlob(text)) {
-                    if (ui.posPromptText.empty()) ui.posPromptText = text;
-                    else if (ui.negPromptText.empty()) ui.negPromptText = text;
+                // A partial join may begin with its own "[Class]" marker, which
+                // is not a serialized blob.
+                if (!text.empty() && (PartialTextFlag() || !LooksLikeSerializedTextBlob(text))) {
+                    if (ui.posPromptText.empty() && !posSlotHeld) { ui.posPromptText = text; posPartial = PartialTextFlag(); }
+                    else if (ui.negPromptText.empty()) { ui.negPromptText = text; negPartial = PartialTextFlag(); }
+                } else if (text.empty() && JoinBlankedFlag() && ui.posPromptText.empty()) {
+                    posSlotHeld = true;
                 }
             } else if (classType.rfind("WeiLinPromptUI", 0) == 0 && inputs->find("positive")) {
                 // Both role instances name their text "positive": fill pos,
                 // then neg, in encounter order like "text" above.
+                PartialTextFlag() = false;
                 std::string text = ResolveTextField(nodesObj, inputs->find("positive"));
-                if (!text.empty() && !LooksLikeSerializedTextBlob(text)) {
-                    if (ui.posPromptText.empty()) ui.posPromptText = text;
-                    else if (ui.negPromptText.empty()) ui.negPromptText = text;
+                // A partial join may begin with its own "[Class]" marker, which
+                // is not a serialized blob.
+                if (!text.empty() && (PartialTextFlag() || !LooksLikeSerializedTextBlob(text))) {
+                    if (ui.posPromptText.empty() && !posSlotHeld) { ui.posPromptText = text; posPartial = PartialTextFlag(); }
+                    else if (ui.negPromptText.empty()) { ui.negPromptText = text; negPartial = PartialTextFlag(); }
                 }
             } else {
                 // Separate "prompt"/"negative_prompt" on one node: read both
                 // by name, since the encounter-order guess above would only
                 // ever see one of them.
-                if (ui.posPromptText.empty()) {
+                if (ui.posPromptText.empty() && !posSlotHeld) {
                     if (const auto* v = inputs->find("prompt")) {
+                        PartialTextFlag() = false;
                         std::string t = ResolveTextField(nodesObj, v);
-                        if (!t.empty()) ui.posPromptText = t;
+                        if (!t.empty()) { ui.posPromptText = t; posPartial = PartialTextFlag(); }
                     }
                 }
                 if (ui.negPromptText.empty()) {
                     if (const auto* v = inputs->find("negative_prompt")) {
+                        PartialTextFlag() = false;
                         std::string t = ResolveTextField(nodesObj, v);
-                        if (!t.empty()) ui.negPromptText = t;
+                        if (!t.empty()) { ui.negPromptText = t; negPartial = PartialTextFlag(); }
                     }
                 }
             }
@@ -2332,13 +2720,10 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
         // reclaimed by a looser match once some pack grows a "lora_name"
         // input or a "Lora" substring.
         //
-        // LoraTagLoader has no lora_name or slot fields: it reads its list
-        // out of A1111-style "<lora:name:weight>" tags in its own "text".
-        if (classType == "LoraTagLoader") {
-            if (const auto* v = inputs->find("text")) {
-                std::string text = ResolveTextField(nodesObj, v);
-                ExtractLoraTags(text, loras);
-            }
+        // LoraTagLoader and its kin have no lora_name or slot fields: they
+        // read "<lora:name:weight>" tags out of their own text.
+        if (CollectTaggedLoras(nodesObj, classType, inputs, loras)) {
+            // a node that applies <lora:> tags from its own text: done
         }
         else if (classType == "Lora Loader (LoraManager)") {
             // A multi-select loader storing its slots under a plain "loras"
@@ -2507,18 +2892,23 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                 // One variant packs width/height into a single free-form
                 // "dimensions" string, e.g. " 832 x 1216  (portrait)".
                 std::string dims = ResolveTextField(nodesObj, dimField);
-                size_t wStart = dims.find_first_of("0123456789");
-                if (wStart != std::string::npos) {
-                    size_t wEnd = dims.find_first_not_of("0123456789", wStart);
-                    std::string wStr = dims.substr(wStart, wEnd - wStart);
-                    size_t xPos = dims.find('x', wEnd);
-                    if (xPos != std::string::npos) {
-                        size_t hStart = dims.find_first_of("0123456789", xPos);
-                        if (hStart != std::string::npos) {
-                            size_t hEnd = dims.find_first_not_of("0123456789", hStart);
-                            std::string hStr = dims.substr(hStart, hEnd - hStart);
-                            if (!wStr.empty() && !hStr.empty()) widthHeight = wStr + "x" + hStr;
-                        }
+                // Preset names can carry a ratio prefix ("3:4 portrait
+                // (default) - 840x1120"), so the size is the first
+                // <digits>x<digits> pair (spaces allowed around the x), not
+                // the first digit run in the string.
+                for (size_t xp = dims.find_first_of("xX"); xp != std::string::npos;
+                     xp = dims.find_first_of("xX", xp + 1)) {
+                    size_t wEnd = xp;
+                    while (wEnd > 0 && dims[wEnd - 1] == ' ') wEnd--;
+                    size_t wStart = wEnd;
+                    while (wStart > 0 && dims[wStart - 1] >= '0' && dims[wStart - 1] <= '9') wStart--;
+                    size_t hStart = xp + 1;
+                    while (hStart < dims.size() && dims[hStart] == ' ') hStart++;
+                    size_t hEnd = hStart;
+                    while (hEnd < dims.size() && dims[hEnd] >= '0' && dims[hEnd] <= '9') hEnd++;
+                    if (wStart < wEnd && hStart < hEnd) {
+                        widthHeight = dims.substr(wStart, wEnd - wStart) + "x" + dims.substr(hStart, hEnd - hStart);
+                        break;
                     }
                 }
             }
@@ -2559,38 +2949,55 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
             if (GetLinkNodeId(posLink).empty() || GetLinkNodeId(negLink).empty()) continue;
             // ResolveTextField follows the link through an encoder's own "text"
             // as well as a plain string node's "value".
+            PartialTextFlag() = false;
             std::string pos = ResolveTextField(nodesObj, posLink);
+            const bool savedPosPartial = PartialTextFlag();
+            PartialTextFlag() = false;
             std::string neg = ResolveTextField(nodesObj, negLink);
             if (!pos.empty()) {
                 ui.posPromptText = std::move(pos);
                 ui.negPromptText = std::move(neg);
+                posPartial = savedPosPartial;
+                negPartial = PartialTextFlag();
             }
             break;
         }
     }
 
-    std::string resolvedPos = ResolveClipText(nodesObj, positiveNodeId, /*isPositive=*/true);
-    std::string resolvedNeg = ResolveClipText(nodesObj, negativeNodeId, /*isPositive=*/false);
-    if (!resolvedPos.empty()) ui.posPromptText = resolvedPos;
-    if (!resolvedNeg.empty()) ui.negPromptText = resolvedNeg;
+    // The preferred key picks the right literal on a prompt node that feeds both
+    // roles from two fields of one node (e.g. AnimaCSVPromptControl slots 0/1).
+    PartialTextFlag() = false;
+    std::string resolvedPos = (positiveNodeId.empty() && posTextField)
+                                  ? ResolveTextField(nodesObj, posTextField, "positive_prompt")
+                                  : ResolveClipText(nodesObj, positiveNodeId, /*isPositive=*/true);
+    const bool resolvedPosPartial = PartialTextFlag();
+    PartialTextFlag() = false;
+    std::string resolvedNeg = (negativeNodeId.empty() && negTextField)
+                                  ? ResolveTextField(nodesObj, negTextField, "negative_prompt")
+                                  : ResolveClipText(nodesObj, negativeNodeId, /*isPositive=*/false);
+    const bool resolvedNegPartial = PartialTextFlag();
+    if (!resolvedPos.empty()) { ui.posPromptText = resolvedPos; posPartial = resolvedPosPartial; }
+    if (!resolvedNeg.empty()) { ui.negPromptText = resolvedNeg; negPartial = resolvedNegPartial; }
     // A deliberately zeroed negative stays blank: the encounter-order guess
     // would otherwise refill it with the text the zeroed conditioning came from.
     // So does a negative the positive's source has no input for (BasicGuider);
     // one that merely failed to resolve may still be companion-filled.
     const bool negAbsent = apiScope.active && !positiveNodeId.empty() && negativeNodeId.empty() && posSourceLacksNegative;
     const bool negZeroed = resolvedNeg.empty() && (IsZeroedConditioning(nodesObj, negativeNodeId) || negAbsent);
-    if (negZeroed) ui.negPromptText.clear();
+    if (negZeroed) { ui.negPromptText.clear(); negPartial = false; }
     // A positive computed at run time resolves empty, and the encounter-order
     // guess may then hold the NEGATIVE text. Leave it blank instead, so a
     // companion text block can fill it.
     if (resolvedPos.empty() && !positiveNodeId.empty() && !resolvedNeg.empty() && ui.posPromptText == resolvedNeg) {
         ui.posPromptText.clear();
+        posPartial = false;
     }
     // Same hazard when the negative resolves empty by design (a zeroed-out
     // negative): keep the guess only if it sits on the positive's own chain.
     if (resolvedPos.empty() && !positiveNodeId.empty() && !ui.posPromptText.empty() && !guessPosNodeId.empty() &&
         guessPosNodeId != positiveNodeId && !ComputeAncestors(nodesObj, positiveNodeId).count(guessPosNodeId)) {
         ui.posPromptText.clear();
+        posPartial = false;
     }
 
     // Every definition (both the array and legacy object-map forms) plus its
@@ -2660,11 +3067,12 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
     }
 
     // Link-resolved text wins over the traversal's positional guess.
-    if (!ui.uiResolvedPos.empty()) ui.posPromptText = ui.uiResolvedPos;
-    if (!ui.uiResolvedNeg.empty()) ui.negPromptText = ui.uiResolvedNeg;
+    if (!ui.uiResolvedPos.empty()) { ui.posPromptText = ui.uiResolvedPos; posPartial = false; }
+    if (!ui.uiResolvedNeg.empty()) { ui.negPromptText = ui.uiResolvedNeg; negPartial = false; }
     // UI-format twin of the unresolvable-positive guard above.
     if (ui.uiResolvedPos.empty() && ui.uiPosLinkSeen && !ui.negPromptText.empty() && ui.posPromptText == ui.negPromptText) {
         ui.posPromptText.clear();
+        posPartial = false;
     }
 
     // Only when the API-format loop found none: it runs over the
@@ -2794,7 +3202,7 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
                 const char* key = nIn->find("noise_seed") ? "noise_seed" : "seed";
                 bool found = false;
                 double n = ResolveNumberField(nodesObj, nIn->find(key), found, key);
-                if (found) { local.seed = SimpleJson::ClampDoubleToInt64(n); local.has_seed = true; }
+                if (found && SimpleJson::SeedFromDouble(n, local.seed)) { local.has_seed = true; }
             }
         }
         if (widthHeight.empty()) {
@@ -2835,6 +3243,8 @@ bool AImgDecoder::DecodeComfyUI(const SimpleJson::JsonValue* root, const std::st
 
     // Confirmed a ComfyUI graph: only now commit to the caller.
     if (outNegativeZeroed) *outNegativeZeroed = negZeroed;
+    if (outPromptPartial) *outPromptPartial = posPartial && !ui.posPromptText.empty();
+    if (outNegativePartial) *outNegativePartial = negPartial && !ui.negPromptText.empty();
     info = std::move(local);
     return true;
 }

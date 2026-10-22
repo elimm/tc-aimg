@@ -26,6 +26,17 @@ inline int64_t ClampDoubleToInt64(double n) {
     return (int64_t)n;
 }
 
+// The Seed column is a signed int64, so a seed at or above 2^63 cannot be
+// shown as a number; clamping it would display a value that looks real but is
+// wrong. Returns false instead, and callers then leave the field blank (Full
+// Parameters still holds the real digits).
+inline bool SeedFromDouble(double n, int64_t& out) {
+    if (!std::isfinite(n)) return false;
+    if (n < -9223372036854775808.0 || n >= 9223372036854775808.0) return false;
+    out = (int64_t)n;
+    return true;
+}
+
 enum class JsonType { Null, Bool, Number, String, Array, Object };
 
 struct JsonValue {
@@ -40,8 +51,9 @@ struct JsonValue {
     // std::map, not unordered_map: a ComfyUI graph creates hundreds of tiny
     // per-node objects, where unordered_map's per-instance bucket array
     // measured ~2x slower and larger than std::map's single tree node.
-    // Re-benchmark before re-attempting this swap.
-    std::map<std::string, std::unique_ptr<JsonValue>> objVal;
+    // Re-benchmark before re-attempting this swap. std::less<> so find("literal")
+    // compares directly instead of building a std::string per call site.
+    std::map<std::string, std::unique_ptr<JsonValue>, std::less<>> objVal;
 
     std::string getStr(const std::string& key = "") const {
         if (key.empty()) return type == JsonType::String ? strVal : "";
@@ -79,6 +91,27 @@ struct JsonValue {
         auto it = objVal.find(key);
         return it != objVal.end() ? it->second.get() : nullptr;
     }
+
+    // Literal-key overloads: no temporary std::string per call site.
+    const JsonValue* find(const char* key) const {
+        if (type != JsonType::Object) return nullptr;
+        auto it = objVal.find(key);
+        return it != objVal.end() ? it->second.get() : nullptr;
+    }
+    // noinline: ~80 call sites; inlined, the copy-out cost ~4.6 KB on x64/MT.
+    __declspec(noinline) std::string getStr(const char* key) const {
+        // if/return, not ?: -- the conditional made a const temporary that
+        // was copied again (one extra heap allocation per long string).
+        const JsonValue* v = find(key);
+        if (v && v->type == JsonType::String) return v->strVal;
+        return std::string();
+    }
+    double getNum(const char* key) const {
+        const JsonValue* v = find(key);
+        return (v && v->type == JsonType::Number) ? v->numVal : 0.0;
+    }
+    int64_t getInt64(const char* key) const { return ClampDoubleToInt64(getNum(key)); }
+    const JsonValue* getObj(const char* key) const { return find(key); }
 };
 
 } // namespace SimpleJson

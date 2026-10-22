@@ -307,10 +307,35 @@ bool JsonNumericValue(const SimpleJson::JsonValue* v, double& out) {
     return false;
 }
 
+// A1111 writes seeds as full-width unsigned integers, so one can exceed
+// INT64_MAX. Wrapping it into the signed column would show a negative number
+// the file never contained; reject it instead (blank beats wrong). A literal
+// "-1" is what the file says and is kept.
+bool ParseA1111Seed(const std::string& v, int64_t& out) {
+    size_t i = 0;
+    while (i < v.size() && (v[i] == ' ' || v[i] == '	')) i++;
+    bool neg = false;
+    if (i < v.size() && (v[i] == '-' || v[i] == '+')) { neg = (v[i] == '-'); i++; }
+    if (i >= v.size() || v[i] < '0' || v[i] > '9') return false;
+    uint64_t mag = 0;
+    for (; i < v.size() && v[i] >= '0' && v[i] <= '9'; i++) {
+        uint64_t d = (uint64_t)(v[i] - '0');
+        if (mag > (UINT64_MAX - d) / 10) return false;
+        mag = mag * 10 + d;
+    }
+    if (neg) {
+        if (mag > (uint64_t)INT64_MAX + 1) return false;
+        out = (mag == (uint64_t)INT64_MAX + 1) ? INT64_MIN : -(int64_t)mag;
+        return true;
+    }
+    if (mag > (uint64_t)INT64_MAX) return false;
+    out = (int64_t)mag;
+    return true;
+}
+
 void ExtractSeedCfgSteps(const SimpleJson::JsonValue* jsonObj, const std::string& cfgKey, AImgInfo& info) {
     double num;
-    if (JsonNumericValue(jsonObj->find("seed"), num)) {
-        info.seed = SimpleJson::ClampDoubleToInt64(num);
+    if (JsonNumericValue(jsonObj->find("seed"), num) && SimpleJson::SeedFromDouble(num, info.seed)) {
         info.has_seed = true;
     }
     if (JsonNumericValue(jsonObj->find(cfgKey), num)) {
@@ -321,6 +346,39 @@ void ExtractSeedCfgSteps(const SimpleJson::JsonValue* jsonObj, const std::string
         info.steps = (int32_t)SimpleJson::ClampDoubleToInt64(num);
         info.has_steps = true;
     }
+}
+
+// The Anima pack's per-image record ("anima_image_seed_v1": seed, positive,
+// negative, prompt_loras [[path, weight], ...]) is what this one image used -
+// wildcards expanded, the batch item's own seed - so it overrides the graph's
+// prompt, negative and seed; LoRAs only fill a gap. Clearing the partial flag
+// stops the companion text replacing an overridden text. Takes the cached
+// parse: calling ParseJson here inlined a second copy of the parser (~3 KB).
+void ApplyAnimaImageRecord(const SimpleJson::JsonValue* root, AImgInfo& info, bool& promptPartial, bool& negativePartial) {
+    if (!root || root->type != SimpleJson::JsonType::Object) return;
+    using SimpleJson::JsonType;
+    const SimpleJson::JsonValue* v = root->find("positive");
+    if (v && v->type == JsonType::String && !v->strVal.empty()) { info.prompt = AImgDecoder::Utf8ToWstring(v->strVal); promptPartial = false; }
+    v = root->find("negative");
+    if (v && v->type == JsonType::String && !v->strVal.empty()) { info.negative_prompt = AImgDecoder::Utf8ToWstring(v->strVal); negativePartial = false; }
+    v = root->find("seed");
+    if (v && v->type == JsonType::Number && SimpleJson::SeedFromDouble(v->numVal, info.seed)) info.has_seed = true;
+    v = root->find("prompt_loras");
+    if (!info.lora.empty() || !v || v->type != JsonType::Array) return;
+    std::string joined;
+    for (const auto& e : v->arrVal) {
+        if (!e || e->type != JsonType::Array || e->arrVal.size() < 2 || !e->arrVal[0] || !e->arrVal[1] ||
+            e->arrVal[0]->type != JsonType::String || e->arrVal[1]->type != JsonType::Number) continue;
+        const std::string& path = e->arrVal[0]->strVal;
+        size_t start = path.find_last_of("\\/");
+        start = start == std::string::npos ? 0 : start + 1;
+        if (start >= path.size()) continue;
+        if (!joined.empty()) joined += ", ";
+        joined.append(path, start, std::string::npos);
+        joined += ": ";
+        joined += AImgDecoderInternal::FormatCompactNumber(e->arrVal[1]->numVal);
+    }
+    if (!joined.empty()) info.lora = AImgDecoder::Utf8ToWstring(joined);
 }
 
 // ComfyUI's A1111-compat save nodes pack "Sampler: <sampler> <scheduler>"
@@ -508,12 +566,20 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
         if (b == std::wstring::npos) return std::wstring();
         return w.substr(b, w.find_last_not_of(L" \t\r\n") - b + 1);
     };
-    auto isJsonShapedCompanion = [](const Candidate& cand) {
-        if (cand.key && (*cand.key == "prompt" || *cand.key == "workflow")) return true;
+    // The content half of the above, also applied to the Fooocus and A1111
+    // loops: a graph-only chunk (a lone "workflow") whose note text mentions
+    // "Steps:" would otherwise satisfy their loose search and have its whole
+    // JSON written into the prompt. A content check, not a key check, so a
+    // genuine A1111 block stored under a "prompt" key still decodes.
+    auto isGraphShapedText = [](const Candidate& cand) {
         const std::string& t = cand.text();
         return !t.empty() && t[0] == '{' &&
                t.find("\nSteps:") == std::string::npos &&
                t.find("\nNegative prompt:") == std::string::npos;
+    };
+    auto isJsonShapedCompanion = [&isGraphShapedText](const Candidate& cand) {
+        if (cand.key && (*cand.key == "prompt" || *cand.key == "workflow")) return true;
+        return isGraphShapedText(cand);
     };
 
     std::vector<Candidate> candidates;
@@ -596,8 +662,14 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
     for (auto* candPtr : comfyOrder) {
         auto& cand = *candPtr;
         SimpleJson::JsonValue* json = getJson(cand);
-        bool negZeroed = false;
-        if (json && DecodeComfyUI(json, cand.text(), info, &negZeroed)) {
+        bool negZeroed = false, promptPartial = false, negativePartial = false;
+        if (json && DecodeComfyUI(json, cand.text(), info, &negZeroed, &promptPartial, &negativePartial)) {
+            for (auto& rec : candidates) {
+                if (rec.key && *rec.key == "anima_image_seed_v1") {
+                    ApplyAnimaImageRecord(getJson(rec), info, promptPartial, negativePartial);
+                    break;
+                }
+            }
             // Some metadata-saving nodes embed a flattened A1111-style text
             // block alongside the graph, carrying fields no node holds. Fill
             // only the gaps; the graph's own values are more precise.
@@ -630,6 +702,12 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
                 // whatever the companion says ("-", "unknown" placeholders, or
                 // the zeroed encoder's own text) must not fill it.
                 if (negZeroed) fallback.negative_prompt.clear();
+                // A graph prompt that still holds dead-end markers is a gap, not
+                // an answer: a companion text with a real prompt beats it. Done
+                // after the duplicate check above so that check still sees the
+                // graph's own prompt.
+                if (promptPartial && !trimWs(fallback.prompt).empty()) info.prompt.clear();
+                if (negativePartial && !negZeroed && !trimWs(fallback.negative_prompt).empty()) info.negative_prompt.clear();
                 MergeGaps(info, fallback);
                 break;
             }
@@ -652,6 +730,7 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
     // check below would always claim it first.
     for (const auto& cand : candidates) {
         if (isRawXmpWrapper(cand)) continue; // see isRawXmpWrapper's comment above
+        if (isGraphShapedText(cand)) continue; // see isGraphShapedText's comment above
         if (DecodeFooocus(cand.text(), info)) {
             return info;
         }
@@ -660,6 +739,7 @@ AImgInfo AImgDecoder::DecodeCore(const RawImageMetadata& rawMeta) {
     // 3. Try Automatic1111 / SD.Next / Forge on candidates.
     for (const auto& cand : candidates) {
         if (isRawXmpWrapper(cand)) continue;
+        if (isGraphShapedText(cand)) continue; // see isGraphShapedText's comment above
         if (DecodeAutomatic1111(cand.text(), info)) {
             // Relabel when the file also carries a ComfyUI chunk/structural
             // marker (keys and graph shape only, never prompt text).
@@ -1049,8 +1129,7 @@ bool AImgDecoder::DecodeAutomatic1111(const std::string& paramText, AImgInfo& in
                     info.cfg_scale = AImgDecoderInternal::ParseLeadingDouble(v.c_str());
                     info.has_cfg = true;
                 } else if (keyIs("Seed")) {
-                    info.seed = AImgDecoderInternal::ParseLeadingUInt64(v.c_str());
-                    info.has_seed = true;
+                    if (ParseA1111Seed(v, info.seed)) info.has_seed = true;
                 } else if (keyIs("Size")) {
                     info.size = Utf8ToWstring(v);
                 } else if (keyIs("Model")) {
@@ -1204,8 +1283,7 @@ bool AImgDecoder::DecodeEasyDiffusion(const SimpleJson::JsonValue* root, const s
     // JsonNumericValue, not a bare find(): presence alone is not proof of a
     // number. See its definition above ExtractSeedCfgSteps.
     double num;
-    if (JsonNumericValue(root->find("seed"), num)) {
-        info.seed = SimpleJson::ClampDoubleToInt64(num);
+    if (JsonNumericValue(root->find("seed"), num) && SimpleJson::SeedFromDouble(num, info.seed)) {
         info.has_seed = true;
     }
     if (JsonNumericValue(root->find("num_inference_steps"), num)) {
@@ -1599,8 +1677,7 @@ bool AImgDecoder::DecodeWanGP(const SimpleJson::JsonValue* root, const std::stri
 
     // JsonNumericValue: presence alone isn't proof of a number.
     double num;
-    if (JsonNumericValue(root->find("seed"), num)) {
-        info.seed = SimpleJson::ClampDoubleToInt64(num);
+    if (JsonNumericValue(root->find("seed"), num) && SimpleJson::SeedFromDouble(num, info.seed)) {
         info.has_seed = true;
     }
     if (JsonNumericValue(root->find("num_inference_steps"), num)) {

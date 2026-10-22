@@ -496,11 +496,61 @@ static bool DecodePngText(const uint8_t* data, size_t len, bool compressed, std:
     return true;
 }
 
+// Structural UTF-8 check (lead/continuation bytes, no overlongs, no surrogates,
+// nothing above U+10FFFF). Used only to tell UTF-8 from Latin-1 text.
+static bool IsValidUtf8(const std::string& s) {
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        const uint8_t c = (uint8_t)s[i];
+        if (c < 0x80) { i++; continue; }
+        size_t extra;
+        uint32_t cp;
+        if (c >= 0xC2 && c <= 0xDF) { extra = 1; cp = c & 0x1F; }
+        else if (c >= 0xE0 && c <= 0xEF) { extra = 2; cp = c & 0x0F; }
+        else if (c >= 0xF0 && c <= 0xF4) { extra = 3; cp = c & 0x07; }
+        else return false;
+        if (i + extra >= n) return false;
+        for (size_t k = 1; k <= extra; k++) {
+            const uint8_t cc = (uint8_t)s[i + k];
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (extra == 2 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) return false;
+        if (extra == 3 && (cp < 0x10000 || cp > 0x10FFFF)) return false;
+        i += extra + 1;
+    }
+    return true;
+}
+
+static std::string Latin1ToUtf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + s.size() / 8);
+    for (char ch : s) {
+        const uint8_t c = (uint8_t)ch;
+        if (c < 0x80) {
+            out.push_back(ch);
+        } else {
+            out.push_back((char)(0xC0 | (c >> 6)));
+            out.push_back((char)(0x80 | (c & 0x3F)));
+        }
+    }
+    return out;
+}
+
+// tEXt and zTXt are Latin-1 by the PNG spec (PIL writes a bare 0xE9), iTXt is
+// UTF-8; but many writers put UTF-8 into tEXt anyway. Valid UTF-8 (pure ASCII
+// included) is kept as is, anything else is taken as Latin-1.
+static std::string Latin1PngTextToUtf8(std::string text) {
+    if (IsValidUtf8(text)) return text;
+    return Latin1ToUtf8(text);
+}
+
 static void StorePngText(RawImageMetadata& outMetadata, const std::string& key,
-                          const uint8_t* data, size_t len, bool compressed) {
+                          const uint8_t* data, size_t len, bool compressed, bool latin1) {
     std::string text;
     if (DecodePngText(data, len, compressed, text)) {
-        outMetadata.text_chunks[key] = std::move(text);
+        outMetadata.text_chunks[key] = latin1 ? Latin1PngTextToUtf8(std::move(text)) : std::move(text);
     }
 }
 
@@ -553,7 +603,7 @@ bool MetadataParser::ExtractPNG(FileReader& file, uint64_t fileSize, RawImageMet
                 if (nullPos) {
                     std::string key((const char*)data, nullPos - data);
                     std::string text((const char*)nullPos + 1, length - (nullPos - data + 1));
-                    outMetadata.text_chunks[key] = text;
+                    outMetadata.text_chunks[key] = Latin1PngTextToUtf8(std::move(text));
                 }
             } else if (chunkType == kZTXt) {
                 const uint8_t* nullPos = (const uint8_t*)memchr(data, 0, length);
@@ -564,7 +614,7 @@ bool MetadataParser::ExtractPNG(FileReader& file, uint64_t fileSize, RawImageMet
                     size_t compLen = length - (nullPos - data + 2);
 
                     if (compMethod == 0 && compLen > 0) {
-                        StorePngText(outMetadata, key, compData, compLen, /*compressed=*/true);
+                        StorePngText(outMetadata, key, compData, compLen, /*compressed=*/true, /*latin1=*/true);
                     }
                 }
             } else if (chunkType == kITXt) {
@@ -595,7 +645,7 @@ bool MetadataParser::ExtractPNG(FileReader& file, uint64_t fileSize, RawImageMet
                                 ParseXMP(text, outMetadata);
                             }
                         } else {
-                            StorePngText(outMetadata, key, ptr, textLen, compressed);
+                            StorePngText(outMetadata, key, ptr, textLen, compressed, /*latin1=*/false);
                         }
                     }
                 }

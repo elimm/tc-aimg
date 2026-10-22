@@ -11,7 +11,8 @@ public:
     static AImgInfo Decode(const RawImageMetadata& rawMeta);
     // Public so aimg.cpp can reuse it for the lazy conversion of
     // full_parameters_utf8 instead of carrying a second wrapper.
-    static std::wstring Utf8ToWstring(const std::string& str);
+    // noinline: ~60 call sites, each of which inlined the sizing pass.
+    __declspec(noinline) static std::wstring Utf8ToWstring(const std::string& str);
 
 private:
     // Per-generator dispatch, then display normalization (model/vae
@@ -21,7 +22,8 @@ private:
     static std::wstring NormalizeLoraField(const std::wstring& raw);
 
     static bool DecodeAutomatic1111(const std::string& paramText, AImgInfo& info, bool populateFullParameters = true);
-    static bool DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info, bool* outNegativeZeroed = nullptr);
+    static bool DecodeComfyUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info, bool* outNegativeZeroed = nullptr,
+                              bool* outPromptPartial = nullptr, bool* outNegativePartial = nullptr);
     static bool DecodeEasyDiffusion(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
     static bool DecodeInvokeAI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);
     static bool DecodeSwarmUI(const SimpleJson::JsonValue* root, const std::string& originalText, AImgInfo& info);

@@ -69,6 +69,8 @@ Tested against **Automatic1111 WebUI**, **Easy Diffusion**, and **ComfyUI** (Com
 | `Full Parameters` | Full Text | Complete raw parameters block or JSON workflow (search dialog only, see note above) |
 | `Has AI Metadata` | Boolean | `Yes` / `No` (useful for quick filtering in Total Commander) |
 
+A ComfyUI prompt can contain a placeholder such as `[TextGenerate]` or `[WD14Tagger|pysssss]`: that part of the prompt was produced at run time (an LLM, an image tagger, a random selector) and the image does not record it. The bracket holds the name of the node that produced it. When the file also carries a plain-text copy of the final prompt, that copy is shown instead.
+
 ---
 
 ## 🚀 Installation
